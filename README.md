@@ -1,30 +1,27 @@
-# EKS_Petclinic — API Gateway · EKS 기반 3-Tier 구축
+# EKS_Petclinic — ALB · WAF 기반 3-Tier 구축
 
-> Spring Petclinic(Spring MVC/JSP)을 **API Gateway → VPC Link V2 → internal ALB → Nginx Web → Tomcat App → RDS MySQL** 구조로 AWS에 올린 실제 구축 결과입니다.
-> 설계 문서와 Terraform 코드, Kubernetes 매니페스트, 컨테이너 빌드 정의를 함께 담았습니다.
+> Spring Petclinic(Spring MVC/JSP)을 **internet-facing ALB + AWS WAF → Nginx Web → Tomcat App → RDS MySQL** 구조로 AWS에 올리는 프로젝트입니다.
+> Terraform 코드, Kubernetes 매니페스트, 컨테이너 빌드 정의, 설계·구축 문서를 함께 담았습니다.
 
-> **토폴로지 다이어그램**: [`docs/아키텍처_토폴로지.drawio`](docs/아키텍처_토폴로지.drawio) — [draw.io](https://app.diagrams.net) 또는 VS Code Draw.io 확장으로 엽니다.
+> **v2 개정 (2026-10-22)**: API Gateway HTTP API · VPC Link V2 · internal ALB · Cognito를 **제거**하고 **internet-facing ALB + AWS WAF** 직접 진입으로 전환했습니다. VPC는 4계층 → **3계층**(public / private workloads / isolated data)으로 축소됩니다.
+> 이 저장소의 Terraform·매니페스트는 아직 **v1(API Gateway) 기준**이며, v2 전환 절차는 [`docs/보류항목_추가구현_계획.md`](docs/보류항목_추가구현_계획.md) 의 D1에 정리했습니다.
+
+> **토폴로지 다이어그램**: [`docs/아키텍처_토폴로지.drawio`](docs/아키텍처_토폴로지.drawio) — v1 스냅샷입니다. [draw.io](https://app.diagrams.net) 또는 VS Code Draw.io 확장으로 엽니다.
 > (`.drawio`는 XML이라 GitHub에서 이미지로 렌더링되지 않습니다.)
 
 ---
 
-## 1. 무엇을 만들었나
+## 1. 목표 아키텍처 (v2)
 
 ```text
 사용자 브라우저
    │ HTTPS 443  (clinic.<도메인>)
    ▼
-Route 53 ── ACM 인증서
-   │
+Route 53 (A alias) ── ACM 인증서 (ap-northeast-2, Regional)
    ▼
-API Gateway HTTP API  (Regional, $default stage, 50 rps / burst 100)
-   │ HTTP_PROXY · VPC_LINK · payload 1.0
-   ▼
-VPC Link V2  (private ingress 서브넷 2개 AZ)
-   │
-   ▼
-internal ALB  (target-type=ip)
-   │
+internet-facing ALB  (public 서브넷 2개 AZ)
+   │  ← AWS WAF Regional WebACL
+   │  target-type: ip
    ▼
 ┌──────────────────────── VPC 10.20.0.0/16 ────────────────────────┐
 │  Tier 1  Nginx Web      ×2  (8080 업무 / 8081 health)            │
@@ -33,13 +30,14 @@ internal ALB  (target-type=ip)
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-- **애플리케이션 외부 진입점은 API Gateway 하나뿐**입니다. ALB는 `internal`이라 인터넷에서 직접 닿지 않습니다.
+- **외부 진입점은 ALB 하나**이고, 그 앞단에 **AWS WAF**가 붙습니다.
+- VPC는 **3계층**(public / private workloads / isolated data)입니다. v1의 private ingress 계층은 제거됩니다.
 - 원본 Petclinic의 JSP/폼 UI를 그대로 유지합니다. REST/SPA로 재작성하지 않았습니다.
 - `ingress-nginx`는 사용하지 않고 **AWS Load Balancer Controller**로 ALB를 선언적으로 관리합니다.
 
 ---
 
-## 2. 실제 동작 확인 결과
+## 2. v1 실제 동작 확인 결과 (실측)
 
 구축 후 실측한 값입니다.
 
@@ -61,16 +59,27 @@ internal ALB  (target-type=ip)
 
 ## 3. 구성 요소
 
-### 네트워크 — 4계층 서브넷
+### 네트워크 — 3계층 서브넷 (v2)
 
 | 계층 | CIDR (AZ-a / AZ-b) | 용도 |
 |---|---|---|
-| Public | `10.20.0.0/24` / `10.20.1.0/24` | Internet Gateway, **AZ별 NAT Gateway 2개**. 워커·DB 미배치 |
-| Private ingress | `10.20.8.0/24` / `10.20.9.0/24` | internal ALB + VPC Link ENI |
+| Public | `10.20.0.0/24` / `10.20.1.0/24` | Internet Gateway, **AZ별 NAT Gateway 2개**, **internet-facing ALB** |
 | Private workloads | `10.20.32.0/20` / `10.20.48.0/20` | EKS 노드 / VPC CNI Pod IP |
 | Isolated data | `10.20.80.0/24` / `10.20.81.0/24` | RDS. **인터넷 기본 경로 없음(VPC local 라우팅만)** |
 
+> v1의 `Private ingress 10.20.8.0/24 · 10.20.9.0/24` 는 VPC Link ENI 전용이었고 **v2에서 제거**됩니다.
+
 VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager, logs, eks-auth, ssm, ssmmessages, ec2messages)
+
+### 진입 · 보호 (v2)
+
+| 항목 | 방식 |
+|---|---|
+| ALB | **internet-facing**, public 서브넷 2개 AZ, `target-type=ip`, HTTPS 443 + HTTP 80→443 리다이렉트 |
+| Target group | Web Pod 8080, health check 8081 `/health/ready`, `success-codes 200` |
+| AWS WAF | Regional WebACL을 ALB에 association. `AWSManagedRulesCommonRuleSet`·`SQLi` 규칙 + IP rate-based(5분/2,000) |
+| 인증 | **Spring Security 폼 로그인 + DB 계정 + Spring Session JDBC** (Cognito 미사용) |
+| 로그 | ALB 액세스 로그 + WAF 로그(본문 미수집, 쿠키 마스킹, sampled requests 비활성) |
 
 ### 컴퓨트 · 데이터
 
@@ -238,7 +247,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES
 
 이후 `schema.sql` / `data.sql`을 **migration 계정으로 1회** 적용합니다(멱등).
 
-### 6-7. 워크로드 · Ingress · edge
+### 6-7. 워크로드 · Ingress (v2: internet-facing ALB)
 
 ```bash
 kubectl apply -f k8s/00-namespace.yaml
@@ -249,19 +258,23 @@ kubectl -n petclinic-dev create secret generic app-config \
 
 kubectl apply -f k8s/10-app.yaml -f k8s/20-web.yaml
 
-# internal ALB subnet / SG 채운 뒤
+# Ingress: scheme=internet-facing, public 서브넷, ACM 인증서, 80→443 리다이렉트
 kubectl apply -f k8s/30-ingress.yaml
-
-# LBC가 만든 listener ARN 확인 → terraform/edge/terraform.tfvars 에 입력
-aws elbv2 describe-listeners --load-balancer-arn <ALB_ARN> --query 'Listeners[].ListenerArn' --output text
-cd terraform/edge && terraform init && terraform apply
 ```
 
-### 6-8. 커스텀 도메인 (선택)
+> v1에서는 internal ALB 뒤에 `terraform/edge`(VPC Link V2 + API Gateway HTTP API)를 추가로 배포했습니다.
+> **v2에서는 `terraform/edge`를 폐기**하고 ALB가 곧 외부 진입점이 됩니다.
+
+### 6-8. WAF 연결 · 커스텀 도메인 (v2)
 
 1. Route53 호스티드 존 생성 후 **등록기관에서 NS 위임**
-2. `terraform/terraform.tfvars`: `enable_custom_domain = true` → ACM DNS 검증
-3. `terraform/edge/terraform.tfvars`: `custom_domain_enabled = true` → 커스텀 도메인 + A(alias) 레코드
+2. `terraform/terraform.tfvars`: `enable_custom_domain = true` → ACM DNS 검증 → **ISSUED**
+3. Ingress에 `certificate-arn`, `listen-ports`(HTTPS 443 + HTTP 80), `ssl-redirect: "443"` 적용
+4. **WAF WebACL 생성 후 `aws_wafv2_web_acl_association`으로 ALB에 연결**
+   (WebACL은 Terraform이, ALB는 AWS Load Balancer Controller가 소유 — 같은 리소스를 이중 소유하지 않는다)
+5. `clinic.<도메인>` → ALB A(alias) 레코드 생성
+
+> WAF 관리형 규칙은 오탐 가능성이 있으므로 **초기에는 count 모드**로 관측한 뒤 block으로 전환합니다.
 
 ---
 
@@ -305,7 +318,7 @@ cd terraform/edge && terraform init && terraform apply
 | D3 | migration Job | 관리 EC2에서 1회 적용 (Job화 미완) |
 | D4 | 앱 `/health/live`·`/ready` | 미구현 (`/`·TCP probe로 대체 중) |
 | D5 | HPA + Cluster Autoscaler | metrics-server만 설치, IRSA 역할 준비됨 |
-| D6 | **Cognito OIDC 인증·인가·CSRF·공유 세션** | **미구현 — UI가 무인증 상태이므로 공개 서비스로 사용 금지** |
+| D6 | **폼 로그인 인증·인가·CSRF·공유 세션** (Cognito 제거) | **미구현 — UI가 무인증 상태이므로 공개 서비스로 사용 금지** |
 | D7 | Secrets Store CSI Driver | K8s Secret 파일 마운트로 대체 중 |
 | D8 | 부하·장애·복구 시험 | 미수행 |
 | D9 | Terraform state 원격화 | 로컬 state |
@@ -314,16 +327,14 @@ cd terraform/edge && terraform init && terraform apply
 
 ## 10. 비용 주의
 
-이 구성은 **실제 과금되는 리소스**를 만듭니다. EKS control plane, 노드 4대, **RDS Multi-AZ**, NAT Gateway 2개, interface VPC endpoint 9개, internal ALB, API Gateway, CloudWatch Logs, ECR, KMS가 계속 과금됩니다.
+이 구성은 **실제 과금되는 리소스**를 만듭니다. EKS control plane, 노드 4대, **RDS Multi-AZ**, NAT Gateway 2개, interface VPC endpoint 9개, **internet-facing ALB + AWS WAF**, CloudWatch Logs, ECR, KMS가 계속 과금됩니다.
 
 - 모든 리소스에 `Project / Environment / Owner / ExpiresAt` 태그를 부여합니다(`terraform.tfvars`에서 설정).
 - Budget 알림은 **자동 비용 상한이 아닙니다.**
-- 실습 후에는 `docs/구축_결과.md` 7장의 순서대로 정리하세요.
-  Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → edge destroy → foundation destroy.
+- 실습 후 정리 순서(설계안 10.3): **WAF association/WebACL 삭제** → Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → foundation destroy.
 
 ```bash
-cd terraform/edge && terraform destroy
-cd .. && terraform destroy     # RDS deletion_protection / 최종 스냅샷 정책 먼저 확인
+terraform destroy    # RDS deletion_protection / 최종 스냅샷 정책 먼저 확인
 ```
 
 ---

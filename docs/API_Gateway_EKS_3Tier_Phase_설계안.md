@@ -1,35 +1,47 @@
-# API Gateway · Amazon EKS 기반 Petclinic 3-Tier 구축 설계안
+# Amazon EKS 기반 Petclinic 3-Tier 구축 설계안 (v2)
 
 > 작성 기준일: 2026-10-22\
 > 문서 상태: **구축 전 설계안**. AWS 리소스 생성, 애플리케이션 변경, 빌드·배포·부하 테스트를 수행한 결과물이 아니다.\
 > 대상 소스: [`spring-petclinic/spring-framework-petclinic`](https://github.com/spring-petclinic/spring-framework-petclinic), 기준 커밋 [`cf392920cdbe9cd07689f1f4b603271940bac957`](https://github.com/spring-petclinic/spring-framework-petclinic/commit/cf392920cdbe9cd07689f1f4b603271940bac957).\
 > 근거와 자료의 제한사항: [자료 검토 및 출처](자료_검토_및_출처.md), [노션 페이지 확인 목록](노션_페이지_확인_목록.md).
 
+## 0. v2 개정 요약
+
+| 구분 | 개정 내용 |
+|---|---|
+| 제거 | Amazon API Gateway HTTP API, VPC Link V2, internal ALB, Amazon Cognito(User Pool/앱 클라이언트/Hosted UI), private ingress 서브넷(`10.20.8.0/24`, `10.20.9.0/24`) |
+| 채택 | internet-facing ALB 직접 진입, AWS WAF Regional WebACL |
+| 유지 | EKS·RDS·ECR·IRSA·Route 53·ACM, Nginx Web·Spring MVC App·Data의 3-Tier |
+| 영향 | VPC 4→3계층, 보안 그룹 단순화, 요청·연결 계층 제거에 따른 비용 구조 변화 |
+
+파일명은 v1 기준이며 이력 보존을 위해 유지한다. 이 문서는 v2의 구축 전 설계안이며 실제 구축·검증 결과를 나타내지 않는다.
+
 ## 1. 목표와 범위
 
 ### 1.1 목표
 
-첨부 PDF의 Web/WAS/RDS 구성을 발전시켜, **API Gateway를 유일한 애플리케이션 외부 진입점으로 사용하고 EKS의 Web·App 계층과 RDS의 Data 계층을 분리**한다. 컨테이너 실행 성공뿐 아니라 재현 가능한 배포, 권한 통제, 다중 AZ 운영, 관측, 장애 복구까지 검증 가능한 프로젝트로 만든다.
+첨부 PDF의 Web/WAS/RDS 구성을 발전시켜, **AWS WAF를 연결한 internet-facing ALB를 애플리케이션 외부 진입점으로 사용하고 EKS의 Web·App 계층과 RDS의 Data 계층을 분리**한다. 컨테이너 실행 성공뿐 아니라 재현 가능한 배포, 권한 통제, 다중 AZ 운영, 관측, 장애 복구까지 검증 가능한 프로젝트로 만든다.
 
 - 사용자 기능: 보호자 검색·등록·수정, 반려동물 등록·수정, 진료 방문 등록, 수의사 조회.
-- 원본 JSP/Spring MVC 화면과 폼을 유지한다. API Gateway는 HTML도 전달하는 HTTP 프록시로 사용한다.
-- 배포 3-Tier는 **Nginx Web → Spring MVC App → RDS MySQL**이다. Gateway와 ALB는 진입·연결 인프라이며 별도 업무 Tier로 세지 않는다.
+- 원본 JSP/Spring MVC 화면과 폼을 유지한다. ALB는 HTML·정적 자산·폼·JSON/XML을 Web으로 전달한다.
+- 배포 3-Tier는 **Nginx Web → Spring MVC App → RDS MySQL**이다. ALB와 WAF는 진입·보호 인프라이며 별도 업무 Tier로 세지 않는다.
 - 소스 내부의 presentation/service/repository **논리 3-layer**, 배포 환경의 **3-tier**, 독립 서비스 분해인 **MSA**는 다르다. 이번 기본안은 모놀리식 Petclinic의 3-tier 운영이지 MSA 전환이 아니다.
 
 ### 1.2 기본안과 제외 범위
 
 | 구분 | 기본 구축 범위 | 기본안에서 제외하거나 후속으로 분리 |
 |---|---|---|
-| 진입 | Regional API Gateway **HTTP API**, VPC Link V2, internal ALB | 외부 공개 ALB 우회 경로, 불필요한 NLB 중첩 |
+| 진입 | internet-facing ALB + AWS WAF Regional WebACL | API Gateway HTTP API, VPC Link V2, internal ALB, private ingress 서브넷, 불필요한 NLB 중첩 |
 | 실행 | EKS Managed Node Group, AWS Load Balancer Controller, Nginx Web, Tomcat App | EKS Auto Mode 동시 사용, ingress-nginx 신규 설치 |
 | 데이터 | RDS MySQL, 런타임 설정 외부화, 버전 관리 마이그레이션 | 운영 DB를 EKS Pod/PVC로 운영, Pod 로컬 H2 |
 | 배포 | Terraform + Helm + GitHub Actions + Argo CD | 콘솔 수작업만으로 운영, `latest` 의존 |
-| 보안 | Cognito OIDC + 애플리케이션 인증·인가·CSRF, 공유 세션 | 원본 CRUD의 무인증 인터넷 공개 |
+| 보안 | Spring Security 폼 로그인 + DB 계정 + Spring Session JDBC, 인가·CSRF | Cognito(User Pool/앱 클라이언트/Hosted UI), 원본 CRUD의 무인증 인터넷 공개 |
 | 확장 | HPA + Cluster Autoscaler, 다중 AZ, PDB | Cluster Autoscaler와 Karpenter의 동일 노드그룹 중복 관리 |
 | 관측 | CloudWatch 로그·지표·알람, 앱/JVM 계측 | 모든 관측 제품의 동시 설치 |
-| 후속 선택 | REST API 확장, 정적 콘텐츠 CDN, 세밀한 카나리, WAF 강화 | 처음부터 SPA 재작성·서비스 메시·멀티 리전 도입 |
+| 보호 범위 | Regional WebACL을 ALB에 직접 연결 | AWS WAF는 CloudFront/API Gateway(지원 REST API stage)에도 연결할 수 있으나 이번 설계에서 제외 |
+| 후속 선택 | REST API 확장, 정적 콘텐츠 CDN, 세밀한 카나리, OIDC/외부 IdP | 처음부터 SPA 재작성·서비스 메시·멀티 리전 도입 |
 
-**가정:** 서울 `ap-northeast-2`, 단일 AWS 계정·리전의 dev부터 시작한다. 운영 목표는 2개 AZ이며, 실제 AZ 이름과 VPC Link 지원 **AZ ID**를 계정에서 확인한다. 도메인 소유권, 예산, 인원, 목표 부하는 Phase 0에서 확정한다. 아래 용량과 일정은 제안값이지 측정 결과가 아니다.
+**가정:** 서울 `ap-northeast-2`, 단일 AWS 계정·리전의 dev부터 시작한다. 운영 목표는 2개 AZ이며, 실제 AZ 이름과 AZ ID를 계정에서 확인한다. 도메인 소유권, 예산, 인원, 목표 부하는 Phase 0에서 확정한다. 아래 용량과 일정은 제안값이지 측정 결과가 아니다.
 
 ## 2. 자료 대조 결과와 반드시 수정할 점
 
@@ -45,7 +57,7 @@
 | HTML 폼 중심이며 `/vets.json`, `/vets.xml`만 일부 읽기 데이터 엔드포인트 제공 | `/api/**`만 열어서는 원본 UI가 동작하지 않는다. 전체 UI 경로를 프록시한다. |
 | 원본에 인증, 전용 health endpoint, 공유 세션 설정이 없음 | 보안·프로브는 **새로 구현할 항목**이다. 구현 전 공개 서비스를 승인하지 않는다. |
 | 원본은 업무 세션과 파일 업로드 의존성이 확인되지 않음 | Redis·EFS는 원본 실행의 필수 구성요소가 아니다. 인증을 추가할 때 공유 세션을 설계한다. |
-| PDF는 NLB + ingress-nginx를 사용하고 향후 ALB/IaC 전환을 제안 | internal ALB + AWS Load Balancer Controller, Terraform/Helm을 기본으로 채택한다. |
+| PDF는 NLB + ingress-nginx를 사용하고 향후 ALB/IaC 전환을 제안 | internet-facing ALB + AWS Load Balancer Controller, Terraform/Helm을 기본으로 채택한다. |
 | ingress-nginx는 공식 공지상 2026년 3월 유지보수 종료 | **ingress-nginx 컨트롤러는 사용하지 않는다.** 일반 Nginx Web 서버와 Kubernetes Ingress API 자체의 종료를 뜻하지 않는다. |
 
 PDF의 평문 DB 인증정보, 장기 액세스 키 저장, Tomcat manager/host-manager 접근 개방, mutable `latest`, 오래된 이미지 버전, 무료 비용 가정은 재사용하지 않는다. 실제 자격증명이었던 값이 있다면 소유자가 폐기·교체하고 저장소 이력과 이미지 레이어까지 점검해야 한다.
@@ -56,42 +68,37 @@ PDF의 평문 DB 인증정보, 장기 액세스 키 저장, Tomcat manager/host-
 
 ```text
 사용자 브라우저
-  │ HTTPS 443 / clinic.example.com
+  │ HTTPS 443 (clinic.<도메인>, 예: clinic.example.com)
   ▼
-Route 53 → API Gateway HTTP API (Regional, public endpoint)
-              │ HTTP_PROXY / VPC_LINK / payload format 1.0
-              ▼
-          VPC Link V2 ENI (private subnet, 2 AZ)
-              │ HTTPS 443, TLS 서버 이름 검증
-              ▼
-          internal ALB (private subnet, 2 AZ)
-              │ target-type: ip / Web Pod:8080
-              ▼
-  Tier 1: Nginx Web Deployment (2+ replicas)
-              │ app-svc:8080 (ClusterIP + Service DNS)
-              ▼
-  Tier 2: Spring MVC / Tomcat App Deployment (2+ replicas)
-              │ JDBC + TLS, TCP 3306
-              ▼
-  Tier 3: RDS MySQL (isolated DB subnets, 운영 Multi-AZ)
+Route 53 (A alias) ── ACM 인증서(ap-northeast-2, Regional)
+  ▼
+Internet-facing ALB (public 서브넷 2개 AZ, scheme=internet-facing)
+  │ ← AWS WAF (Regional WebACL 연결)
+  │ target-type: ip
+  ▼
+Tier 1: Nginx Web Deployment (EKS, 2+ replicas, 8080 업무 / 8081 health)
+  │ app-svc:8080 (ClusterIP + Service DNS)
+  ▼
+Tier 2: Spring MVC / Tomcat App Deployment (EKS, 2+ replicas)
+  │ JDBC + TLS, TCP 3306
+  ▼
+Tier 3: RDS MySQL 8.4.6 (isolated data 서브넷, Multi-AZ)
 
-  별도 인증 흐름: 브라우저 ↔ Cognito 로그인 ↔ App OIDC callback
-  제어 흐름: AWS Load Balancer Controller → ALB/Target Group 설정
-  배포 흐름: GitHub Actions → ECR + 배포 Git → Argo CD → EKS
+제어 흐름: AWS Load Balancer Controller → ALB/Target Group 설정
+배포 흐름: GitHub Actions → ECR + 배포 Git → Argo CD → EKS
 ```
 
-- API Gateway 서비스 자체를 VPC 서브넷 안에 그리지 않는다. VPC 안에는 VPC Link ENI가 만들어진다.
-- **private integration은 백엔드 연결이 private이라는 뜻**이다. HTTP API의 사용자 접속 endpoint까지 private이 되는 것은 아니다.
+- ALB는 public 서브넷에 두고, EKS 노드·Pod는 private workloads, RDS는 isolated data 서브넷에 둔다.
 - ALB의 IP target 모드에서는 실제 데이터가 Web Pod IP로 전달된다. `Ingress → Service → EndpointSlice`는 대상을 찾는 제어 관계이며, ALB 요청이 반드시 ClusterIP를 통과하는 것은 아니다.
-- ALB 연결 설정은 `IngressClass=alb`의 Ingress로 선언한다. Kubernetes Gateway API는 이와 별도의 표준 API이며 AWS API Gateway와 다른 제품/개념이다. Gateway API 전환은 선택한 컨트롤러 버전의 지원 범위를 확인한 후 수행한다.
+- ALB 연결 설정은 `IngressClass=alb`의 Ingress로 선언한다. App Service를 직접 외부에 노출하지 않는다.
 - Nginx는 별도 Web Tier를 보여주기 위해 유지한다. 독립 SPA는 아니며 동적 화면 렌더링은 App의 JSP가 담당한다. 단순화가 우선이면 향후 ALB → App도 가능하지만, 본 프로젝트의 독립 Web Tier 요구와는 구분한다.
 
 ### 3.2 각 계층의 책임
 
 | 계층/구성 | 책임 | 하지 않는 일 |
 |---|---|---|
-| API Gateway | 단일 도메인 진입, 라우트, 요청 제한, 접근 로그, private integration | Pod 스케줄링, DB 접근, HTML을 REST API로 변환 |
-| internal ALB | VPC Link 요청을 healthy Web Pod에 분산 | 인터넷 직접 공개, 사용자 로그인 상태 저장 |
+| Internet-facing ALB | HTTPS 종료, 호스트/경로 기반 L7 라우팅, healthy Web Pod로 분산 | 사용자 로그인 상태 저장, API 키·사용량 계획·요청 검증 |
+| AWS WAF | 관리형 규칙·IP 기반 과다 요청 차단, 요청 관측 | 사용자 인증·인가, 모든 공격의 완전한 차단 보장 |
 | Nginx Web | 리버스 프록시, 헤더 정규화, 자체 health, 보안 헤더 | DB 접속, PHP/IMDS 조회, 업무 처리 |
 | Tomcat App | MVC/JSP, 유효성 검사, 업무 로직, DB 접근, 인증·인가 | 이미지 빌드, 매 시작마다 운영 스키마 생성 |
 | RDS | 업무 데이터·공유 세션 영속화, 백업, Multi-AZ failover | Web 요청 처리, Multi-AZ standby를 읽기 replica로 간주 |
@@ -106,16 +113,15 @@ VPC `10.20.0.0/16` 예시. 기존 네트워크·VPN·Kubernetes Service CIDR과 
 
 | 용도 | AZ-A 예시 | AZ-B 예시 | 기본 경로/용도 |
 |---|---|---|---|
-| Public | `10.20.0.0/24` | `10.20.1.0/24` | IGW, NAT Gateway. 워커·DB 배치 안 함 |
-| Private ingress | `10.20.8.0/24` | `10.20.9.0/24` | internal ALB + VPC Link ENI; 외부 인바운드 경로 없음 |
-| Private workloads | `10.20.32.0/20` | `10.20.48.0/20` | EKS 노드·VPC CNI Pod IP. AZ별 NAT 또는 endpoint |
-| Isolated data | `10.20.80.0/24` | `10.20.81.0/24` | RDS subnet group; 인터넷 기본 경로 없음 |
+| Public | `10.20.0.0/24` | `10.20.1.0/24` | IGW, AZ별 NAT Gateway 1개씩 총 2개, internet-facing ALB. 워커·DB 배치 안 함 |
+| Private workloads | `10.20.32.0/20` | `10.20.48.0/20` | EKS 노드·VPC CNI Pod IP. 각 AZ의 NAT로 기본 경로 설정 |
+| Isolated data | `10.20.80.0/24` | `10.20.81.0/24` | RDS subnet group; 인터넷 기본 경로 없음(VPC local만) |
 
-- ingress 서브넷만 internal ALB 대상 태그/명시적 subnet ID로 선택한다. DB subnet을 ALB 자동 검색 대상에 넣지 않는다.
-- ALB 확장용 IP와 VPC Link ENI, Pod/IP 할당량을 별도로 계산한다. `/24`, `/20`은 출발점이며 무제한 확장을 보장하지 않는다.
-- 운영은 AZ별 NAT, 실습은 단일 NAT로 비용을 줄일 수 있으나 AZ 의존과 cross-AZ 비용을 명시한다.
+- VPC는 위 3계층으로 구성한다. Public 서브넷만 ALB 대상 태그(`kubernetes.io/role/elb=1`)/명시적 subnet ID로 선택하며 DB subnet을 자동 검색 대상에 넣지 않는다.
+- ALB 확장용 IP와 노드·Pod IP 할당량을 별도로 계산한다. `/24`, `/20`은 출발점이며 무제한 확장을 보장하지 않는다.
+- NAT는 AZ별 1개씩 총 2개를 기본으로 하여 다른 AZ의 NAT에 의존하는 경로를 피한다.
 - ECR API/DKR, S3 gateway endpoint, STS, Secrets Manager, CloudWatch Logs, EKS Auth(Pod Identity), SSM 관련 endpoint를 필요한 것만 검토한다. Endpoint만 만들면 모든 외부 통신이 해결되는 것은 아니다.
-- App의 Cognito OIDC discovery/JWKS/token 호출, Argo CD의 Git 접근, 외부 이미지/Helm 접근에는 별도 egress가 필요하다. 지원 endpoint가 없는 목적지는 NAT/제어된 프록시 경로를 유지한다.
+- Argo CD의 Git 접근, 외부 이미지/Helm 접근에는 별도 egress가 필요하다. 지원 endpoint가 없는 목적지는 NAT/제어된 프록시 경로를 유지한다.
 - EKS API endpoint는 private 기본. 관리자는 VPN 또는 private 관리 EC2의 SSM을 통해 접근한다. SSM은 적절한 NAT/VPC endpoint가 있으면 public IP 없이도 가능하다.
 
 ### 4.2 보안 그룹과 NetworkPolicy
@@ -124,18 +130,18 @@ VPC `10.20.0.0/16` 예시. 기존 네트워크·VPN·Kubernetes Service CIDR과 
 
 | 출발 | 도착 | 허용 | 근거 |
 |---|---|---|---|
-| 사용자 | API Gateway 도메인 | HTTPS 443 | 유일한 애플리케이션 공개 진입점 |
-| `sg-vpclink` | `sg-alb` | TCP 443 | private integration |
+| `0.0.0.0/0` | `sg-alb` | TCP 443 | WAF 연결 ALB에서 요청 검사; SG 자체가 WAF를 구분하는 것은 아님 |
+| (선택) `0.0.0.0/0` | `sg-alb` | TCP 80 | 443 리다이렉트만, 업무 응답 금지 |
 | `sg-alb` | `sg-web-node` / Web Pod | TCP 8080·8081 | 업무 target 8080, 별도 health 8081 |
 | Web workload | App workload | TCP 8080 | Nginx → `app-svc` |
 | `sg-app-node` | `sg-rds` | TCP 3306 | 기본안의 App 전용 노드 출발 JDBC |
 | 관리 경로 | EKS API | TCP 443 | IAM Access Entries + RBAC 병행 |
-| 허용 workload | DNS, 필요한 AWS API/IdP/Git | DNS 53, HTTPS 443 등 | 실제 dependency별 allowlist |
+| 허용 workload | DNS, 필요한 AWS API/Git | DNS 53, HTTPS 443 등 | 실제 dependency별 allowlist |
 
 - RDS에 cluster 공통 SG나 `0.0.0.0/0`를 허용하지 않는다. 기본안의 App node SG는 **Pod 단위 권한이 아님**을 인정하고 App 노드에 임의 workload를 배치할 권한을 제한한다. 더 강한 격리가 필요하면 Security Groups for Pods를 별도 검증해 적용한다.
 - EKS 관리 통신, kubelet, webhook, CNI, DNS의 필수 통신 규칙은 위 업무 흐름표와 별개로 유지한다. 단순히 위 포트만 남겨 클러스터 통신을 깨뜨리지 않는다.
 - VPC CNI NetworkPolicy 지원을 활성화·검증한다. namespace default-deny에서 시작해 Web → App, App → DB, DNS, 필요한 egress를 허용한다.
-- ALB → Web 허용은 Pod label selector로 ALB를 표현하지 않고 ingress subnet/IP 정책과 SG를 함께 검증한다. Node/probe 트래픽의 적용 예외도 테스트한다.
+- ALB → Web 허용은 Pod label selector로 ALB를 표현하지 않고 ALB가 배치된 public 서브넷의 사설 IP 범위와 SG를 함께 검증한다. Node/probe 트래픽의 적용 예외도 테스트한다.
 - `web` Pod → RDS, 임의 Pod → App/RDS, 인터넷 → 노드/DB는 **실패해야 성공**인 음성 테스트로 남긴다. 같은 대상의 허용 경로가 성공하는 정상 대조군을 두고 DNS·이미지 pull·테스트 명령 실패와 정책 차단을 종료 코드·흐름 관측으로 구분한다. `실패 || echo BLOCKED`만으로 통과시키지 않는다. 여러 NetworkPolicy의 허용은 합집합이므로 정책 전체와 라벨 수정 RBAC도 점검한다.
 - 기본 서비스는 ClusterIP. 인터넷용 NodePort/LoadBalancer Service를 별도로 만들지 않는다. NetworkPolicy만으로 노드 관리자까지 방어한다고 주장하지 않는다.
 
@@ -150,6 +156,22 @@ VPC `10.20.0.0/16` 예시. 기존 네트워크·VPN·Kubernetes Service CIDR과 
 - CSI 파일 rotation만으로 이미 열린 JDBC pool이 자동 갱신되지는 않는다. 파일 갱신 → 안전한 pool 재연결 또는 rolling restart → 구 credential 폐기의 순서를 실험한다.
 - Kubernetes Secret을 사용하게 되는 경우에도 Base64는 암호화가 아니므로 RBAC·저장 암호화·노출 차단이 필요하다.
 
+### 4.4 AWS WAF 설계
+
+| 항목 | 설계값 |
+|---|---|
+| 배치 | `ap-northeast-2`, `scope=REGIONAL` WebACL을 ALB ARN에 연결; Terraform `aws_wafv2_web_acl_association` 사용 |
+| 관리형 규칙 | `AWSManagedRulesCommonRuleSet`, `AWSManagedRulesKnownBadInputsRuleSet`, `AWSManagedRulesSQLiRuleSet` |
+| 과다 요청 | Rate-based rule, `aggregate_key_type=IP`, `evaluation_window_sec=300`, `limit=2000` 제안(5분당 IP 2,000 요청 초과 차단) |
+| 로그 | CloudWatch Logs `aws-waf-logs-petclinic-dev`, retention 30일, 접근 권한·암호화 적용 |
+| 민감값 | `Cookie`·`Authorization` 헤더를 redacted fields로 마스킹. 요청 본문은 원문 로그로 수집하지 않으며 샘플 요청 수집은 비활성화 |
+| 운영 전환 | 초기 관리형 규칙은 count 모드로 오탐 관측 → 정당한 JSP 폼·한글 입력 회귀시험 → 예외 최소화 후 block 전환 |
+
+- 관리형 규칙은 오탐 가능성이 있다. Rate-based rule도 정밀한 요청 할당량 보장이 아니므로 공유 NAT 사용자와 정상 부하에 미치는 영향을 검증한다.
+- WAF 표준 로그는 요청 본문 전체를 기록하지 않는다. 본문 마스킹을 지원하지 않는 redacted fields에 본문을 지정했다고 주장하지 않으며 Web/App·별도 수집 파이프라인에서도 본문·쿠키를 제거/마스킹한다. 로그 redaction은 sampled requests에 자동 적용되지 않으므로 `sampled_requests_enabled=false`를 적용한다.
+- ALB 뒤 실제 클라이언트 IP는 **신뢰 경계에서 정규화한 `X-Forwarded-For` 첫 값**으로 식별한다. ALB의 기본 append 모드에서는 사용자가 보낸 선행 값을 신뢰하지 않고, Web이 ALB에서 온 연결만 허용한 뒤 ALB가 추가한 마지막 IP를 검증해 단일 값으로 재작성한다. WAF rate 집계는 전달 헤더가 아닌 직접 접속 source IP를 사용한다.
+- 공개 전 WAF association·로그·차단 규칙을 확인한다. WAF는 Spring Security 인증·인가·CSRF를 대신하지 않는다.
+
 ## 5. 애플리케이션·데이터 계약
 
 ### 5.1 원본 수정 범위
@@ -162,8 +184,8 @@ VPC `10.20.0.0/16` 예시. 기존 네트워크·VPN·Kubernetes Service CIDR과 
 | DB 초기화 | 운영에서 `jdbc:initialize-database` 비활성화; demo/test에만 허용 | Pod 동시 재시작 시 DDL·seed 재실행 없음 |
 | migration | 버전 SQL + Flyway/Liquibase Job 중 하나 선택 | schema history, 단일 실행/잠금, 재실행 안전성 |
 | health | `/health/live`, `/health/ready` 신규 구현 | DB 장애 시 live 200, ready 503; 복구 후 ready 200 |
-| 프록시 인식 | 신뢰 경계에서 헤더 정규화 후 filter/서블릿 설정 적용 | HTTPS callback·Location·쿠키 정상, 내부 host 미노출 |
-| 인증·인가 | Spring Security OIDC + Cognito; 읽기/쓰기 역할 분리 | 비로그인 차단, 권한 부족 403, CSRF 검증 |
+| 프록시 인식 | 신뢰 경계에서 헤더 정규화 후 filter/서블릿 설정 적용 | HTTPS Location·쿠키 정상, 내부 host 미노출 |
+| 인증·인가 | Spring Security 폼 로그인 + DB `users`/`authorities`, 읽기/쓰기 역할 분리 | 비로그인 차단, 권한 부족 403, CSRF 검증 |
 | 공유 세션 | Spring Session JDBC를 RDS 별도 테이블/스키마에 추가 | 로그인 후 App Pod 교체·분산에도 세션 유지 |
 | 운영 계측 | 구조화 로그, request ID, JVM/HTTP/DB pool 지표 | 요청 흐름 연계와 알람 발생 확인 |
 
@@ -171,7 +193,7 @@ Spring Session JDBC는 **인증 도입에 따른 새 선택**이며 원본 기�
 
 ### 5.2 DB 설정과 초기화
 
-- DB 엔진: **RDS MySQL 8.4 계열 중 서울 리전에서 지원되는 버전**을 후보로 선정하고 JDBC driver/SQL과 통합 검증한다. PDF의 특정 minor 버전을 그대로 고정하지 않는다.
+- DB 엔진 설계값은 **RDS MySQL 8.4.6**이다. Phase 0에서 서울 리전·선택 인스턴스의 해당 버전 제공 여부와 JDBC driver/SQL 호환성을 확인한다. 미지원이면 생성을 보류하고 버전 ADR을 갱신한다.
 - 빌드 profile `MySQL`은 DB driver/자원 선택이다. Spring profile `jpa`/`jdbc`/`spring-data-jpa`는 repository 구현 선택이다. 기본은 기존 `jpa`를 유지하되 운영 profile과 조합 시 bean 중복 여부를 확인한다.
 - 실제 키는 `jdbc.url`, `jdbc.username`, `jdbc.password` 등이다. 비밀 파일을 명시적으로 읽도록 소스를 수정하고 Java system property/환경변수의 암묵적 동작에 기대지 않는다.
 - MySQL schema의 CREATE/ALTER DATABASE는 bootstrap으로 분리한다. 앱 계정에는 업무에 필요한 DML 권한만, migration 계정에는 승인된 DDL 권한만 부여한다.
@@ -189,60 +211,72 @@ Spring Session JDBC는 **인증 도입에 따른 새 선택**이며 원본 기�
 - startupProbe는 느린 JVM/JSP 초기화를 허용하고, liveness는 DB 장애와 분리한다. readiness의 DB 체크는 짧은 제한시간·과도하지 않은 주기로 수행한다.
 - 원본에는 Actuator가 없으므로 `/actuator/health`를 즉시 사용 가능한 경로로 적지 않는다.
 
-## 6. API Gateway 상세 설계
+### 5.4 인증·인가·세션 계약
 
-### 6.1 HTTP API 선택 이유와 대안
-
-| 항목 | 기본 HTTP API | REST API가 필요한 조건 |
-|---|---|---|
-| 비용/기능 | 단순 HTTP proxy, stage/route throttle, 접근 로그 | 소비자별 usage plan/API key, 요청 검증, API 캐시 등 |
-| VPC 연동 | VPC Link V2 → ALB listener ARN | 현재 공식 문서는 REST API의 VPC Link V2/ALB도 지원하므로 구형 NLB 전용 설명과 구분 |
-| 인증 | 필요 시 JWT/IAM/Lambda authorizer | 요구 인증 체계와 기능 비교 후 선택 |
-| WAF | HTTP API에 직접 연결 지원 안 됨 | API Gateway에 직접 WAF가 필요하면 REST API 검토 |
-| endpoint | Regional public | private API endpoint가 필수면 REST API 검토 |
-| tracing | 접근 로그·앱 계측으로 연계 | HTTP API에 REST API의 X-Ray 기능을 있다고 쓰지 않음 |
-
-기본안은 API key/usage plan이 필요 없는 교육·내부 업무용 웹 애플리케이션을 가정한다. WAF가 필요하면 internal ALB 적용 또는 REST API 전환을 검토한다. ALB WAF의 클라이언트 IP 인식은 VPC Link 경유 특성을 반영해 별도 검증한다.
-
-### 6.2 연동 계약
-
-| 설정 | 설계값 |
+| 항목 | 설계값 |
 |---|---|
-| 외부 도메인 | `clinic.example.com` — 예시, 소유 도메인으로 교체 |
-| stage/base path | `$default` stage, custom domain API mapping은 빈 경로 |
-| route | `ANY /`, `ANY /{proxy+}` → 같은 HTTP proxy integration |
-| UI route 인증 | Gateway의 UI route는 `NONE`; App에서 OIDC/세션·인가 강제. 인증 없는 앱 공개를 뜻하지 않음 |
-| integration | `HTTP_PROXY`, `VPC_LINK`, method `ANY`, payload format `1.0` |
-| integration URI | **ALB HTTPS listener ARN**, DNS 주소/ClusterIP가 아님 |
-| path mapping | `overwrite:path = $request.path`로 stage 접두사 제거 |
-| 백엔드 TLS | `tlsConfig.serverNameToVerify`에 ALB 인증서 이름 지정 |
-| ALB | `scheme=internal`, `target-type=ip`, path 기반 `/` → Web |
-| root context | 외부 `/` = Web 프록시 `/` = Tomcat `/` |
-| API 기본 endpoint | 도메인 검증 후 `disableExecuteApiEndpoint=true` |
-| logging | request ID, route, status, integration latency/error; 인증 토큰·본문 제외 |
+| 로그인 | 외부 IdP 없이 Spring Security 폼 로그인(`/login`), DB `users`/`authorities` 계정 조회 |
+| 계정 | 승인된 관리 절차로 생성, 공개 회원가입 제외, 비밀번호는 BCrypt 등 지원 PasswordEncoder 해시로 저장 |
+| 읽기 역할 | `ROLE_READER`: 업무 GET 조회 허용, 업무 등록·수정 POST 금지 |
+| 쓰기 역할 | `ROLE_WRITER`: 조회 및 업무 등록·수정 허용. URL·HTTP method별 명시적 규칙, 나머지는 deny |
+| CSRF | JSP 폼에 토큰 포함, 누락·변조 거부. 로그아웃도 CSRF 검증 POST 사용 |
+| 세션 | Spring Session JDBC, RDS의 전용 세션 테이블, 비활성 TTL 30분 제안, 로그인 시 세션 ID 교체 |
+| 쿠키 | `Secure; HttpOnly; SameSite=Lax; Path=/`, Domain 미지정(host-only) 기본 |
 
-API Gateway, VPC Link, ALB는 같은 AWS 계정에 둔다. VPC Link는 생성 후 subnet/SG 변경이 불가하므로 변경 시 교체·전환 절차가 필요하다. 60일 무트래픽 시 INACTIVE가 될 수 있어 장기 중단 실습 환경은 재가동 사전 점검을 수행한다.
+인증 구현 전에는 무인증 상태이므로 공개 서비스로 승인하지 않는다. 로그인 화면·필수 정적 자산만 예외로 열고 업무 URL은 인증·역할 검증을 거친다. DB 장애가 인증 우회로 이어지지 않도록 실패 시 차단하며 로그인 실패 제한도 구현한다. OIDC/외부 IdP 도입은 §10.4의 후속 선택 과제로 분리한다.
+
+## 6. ALB 상세 설계
+
+### 6.1 진입·TLS·라우팅
+
+| 항목 | 설계값 |
+|---|---|
+| 배치 | `scheme=internet-facing`, public `10.20.0.0/24`·`10.20.1.0/24`, 2 AZ |
+| 대상 | `target-type=ip`, Web Pod TCP 8080; App 직접 target 금지 |
+| DNS | `clinic.example.com`(소유 도메인으로 교체), Route 53 A alias → ALB |
+| ACM | `ap-northeast-2` Regional 인증서, DNS 검증; 예시 ARN `arn:aws:acm:ap-northeast-2:123456789012:certificate/11111111-2222-3333-4444-555555555555` |
+| Listener | HTTPS 443 + ACM, TLS 1.2/1.3 지원 정책 `ELBSecurityPolicy-TLS13-1-2-2021-06`; HTTP 80 → HTTPS 443 `HTTP_301` redirect |
+| 규칙 | canonical Host `clinic.example.com`, path `/*` → Web; 불일치 Host는 fixed-response 404 |
+| WAF | Regional WebACL을 ALB에 연결(§4.4), 업무 요청 검사 |
+| 액세스 로그 | S3 전용 bucket/prefix에 저장, 전송 허용 bucket policy·public access block·암호화·lifecycle 30일 적용 |
+
+**HTTP→HTTPS 리다이렉트는 ALB에서 수행**한다. Web은 ALB에서 온 요청만 받으며 `X-Forwarded-Proto`를 허용 listener/canonical HTTPS 기준으로 정규화한다. App은 Web 신뢰 경계만 신뢰하고 사용자 임의 `Forwarded`·`X-Forwarded-*` 값을 그대로 채택하지 않는다.
+
+ALB는 호스트/경로 기반 L7 라우팅을 제공하며 **API 키·사용량 계획·요청 검증 같은 API 관리 기능은 없다.** 필요하면 별도 계층을 추가해야 한다. WAF rate 제한도 소비자별 사용량 계획을 대신하지 않는다. ALB 액세스 로그 저장 대상은 S3로 정하며 CloudWatch 지표·알람과 구분한다.
+
+### 6.2 Target group·health·draining
+
+| 항목 | 초기 제안값 |
+|---|---|
+| 업무 target | HTTP 8080, Web Pod IP |
+| ALB health check | HTTP 8081 `/health/ready`, `success-codes=200` |
+| health interval / timeout | 15초 / 5초 |
+| healthy / unhealthy threshold | 2회 / 2회 |
+| target draining | `deregistration_delay.timeout_seconds=30` |
+| 종료 연계 | `terminationGracePeriodSeconds=60` 출발, preStop/drain 전파·진행 중 요청 완료 시간 실측 후 조정 |
+| ALB idle timeout | `idle_timeout.timeout_seconds=60` |
+| ALB client keepalive | `client_keep_alive.seconds=3600` |
+| Web keepalive | `keepalive_timeout=75s`, ALB idle timeout보다 길게 유지; App upstream keepalive 32 제안 |
+
+- LBC Ingress annotation으로 `alb.ingress.kubernetes.io/scheme: internet-facing`, `alb.ingress.kubernetes.io/target-type: ip`, `alb.ingress.kubernetes.io/healthcheck-port: '8081'`, `alb.ingress.kubernetes.io/healthcheck-path: /health/ready`, `alb.ingress.kubernetes.io/success-codes: '200'`을 선언한다. Listener·인증서·redirect·target group 속성도 선택한 LBC 버전의 지원 형식으로 고정한다.
+- Web은 업무 listener 8080과 **관리 listener 8081**을 분리한다. ALB target은 8080, health check는 8081, kubelet Web probe도 8081을 사용한다. 8081은 외부 route/Service 업무 포트로 공개하지 않는다. Web 8080에서 `/health/*`를 차단해 App의 같은 경로도 외부로 프록시하지 않는다. App probe는 kubelet이 App Pod에 직접 수행한다. Web 자체 health·App readiness·사용자 end-to-end 상태는 서로 다른 지표다.
+- draining·Pod readiness·종료 대기는 함께 검증한다. 모든 target이 unhealthy일 때 ALB의 fail-open 가능성이 있으므로 health check만을 보안 차단 수단으로 사용하지 않는다.
 
 ### 6.3 경로·헤더·쿠키
 
-- `/`, `/owners/**`, `/vets`, `/vets.json`, `/vets.xml`, `/resources/**`, `/webjars/**`와 신규 OIDC 로그인/callback/logout 경로를 보존한다.
-- URI prefix만 제거해도 HTML 링크·form action·`Location`이 자동 수정되는 것은 아니다. `/prod`·`/petclinic`을 외부 경로에 섞지 않는 것을 기본으로 한다.
-- API Gateway parameter mapping에서 `Forwarded`, `X-Forwarded-*`, `Authorization` 등 예약 헤더를 임의 overwrite하려고 하지 않는다.
-- Web 프록시가 외부 호스트와 HTTPS를 **설정된 canonical 값으로 정규화**하고 임의 사용자 `Forwarded` 값을 제거한 뒤 App에 전달한다. App은 이 경계만 신뢰한다. request ID는 비예약 사용자 정의 헤더로 전달한다.
-- ALB host rule이 원래 브라우저 Host를 그대로 받는다고 가정하지 않는다. 전용 internal ALB의 path rule과 TLS SNI 이름을 분리해 검증한다.
-- OIDC redirect URI는 `https://clinic.example.com/login/oauth2/code/<registration-id>` 등 구현된 callback과 정확히 일치시킨다.
-- UI 전체에 JWT authorizer만 걸면 일반 브라우저 navigation/form POST가 Bearer를 자동 첨부하지 못한다. **기본 UI는 App의 OIDC 로그인·공유 세션으로 보호**한다.
-- 읽기·쓰기 역할과 URL/HTTP method별 권한을 App에서 통제한다. CSRF 토큰을 JSP 폼에 포함하고 누락/변조를 거부한다. 쿠키는 Secure, HttpOnly, 적절한 SameSite 및 Path `/`, domain 최소 범위를 사용한다.
-- ALB와 Nginx stickiness로 세션 공유를 대신하지 않는다. 로그인 및 OIDC state도 Pod 교체를 견뎌야 한다.
+- `/`, `/owners/**`, `/vets`, `/vets.json`, `/vets.xml`, `/resources/**`, `/webjars/**`와 `/login`, `/logout` 등 구현된 인증 경로를 보존한다.
+- 외부 `/` = Web 프록시 `/` = Tomcat ROOT context `/`로 일치시킨다. `/prod`·`/petclinic` 접두사를 외부 경로에 섞지 않는다.
+- Web은 Host를 canonical `clinic.example.com`, scheme을 HTTPS로 정규화하고 임의 사용자 `Forwarded` 값을 제거한다. App의 `Location`·form action·절대 URL에 내부 주소가 노출되지 않게 한다.
+- 클라이언트 IP 정규화는 §4.4를 따른다. 요청 ID는 Web에서 생성/검증해 App 로그와 연결하고 ALB 로그의 추적 필드와도 연계한다. 사용자 입력을 그대로 로그 키로 신뢰하지 않는다.
+- 인증·인가·CSRF·쿠키 정책은 §5.4를 적용한다. ALB와 Nginx stickiness로 Spring Session JDBC를 대신하지 않는다.
 - 같은 도메인 사용이므로 기본 CORS는 필요 없다. 후속 SPA 분리 시에만 허용 origin/method/header를 명시한다. credential 사용 시 wildcard origin 금지.
-- Web는 업무 listener 8080과 **관리 listener 8081**을 분리한다. ALB target은 8080, health check는 8081의 `/health/ready`, kubelet Web probe도 8081을 사용한다. 8081은 외부 route/Service 업무 포트로 공개하지 않는다. Web 8080에서 `/health/*`를 차단해 App의 같은 경로도 외부로 프록시하지 않는다. App probe는 kubelet이 App Pod에 직접 수행한다. Web 자체 health·App readiness·사용자 end-to-end 상태는 서로 다른 지표다.
 
 ### 6.4 시간·크기·제한
 
-- 공식 HTTP API 최대 integration timeout은 **30초**, payload는 **10 MB**, request line+header 합계는 **10,240 bytes**다. 큰 쿠키·토큰·헤더도 테스트한다.
-- 초기 설정 예: SQL/connection acquisition timeout 5초, App 요청 목표 20초 미만, Nginx upstream read 25초, Gateway integration 29초. 실제 라이브러리와 배포 시간에 맞춰 조정한다.
-- 긴 작업은 동기 요청을 오래 붙잡지 말고 향후 비동기 Job/상태 조회로 분리한다. 대용량 파일은 필요 시 S3 presigned URL을 검토한다.
-- throttle 예: steady 50 req/s, burst 100에서 시작하되 계정 quota·비용·부하 측정에 맞춰 조정한다. best-effort 제한을 과금의 절대 상한으로 보지 않는다.
+- 초기 설정 예: SQL/connection acquisition timeout 5초, App 요청 목표 20초 미만, Nginx upstream read 25초, ALB idle timeout 60초. 계층별 timeout 의미가 다르므로 실제 요청·배포 시간에 맞춰 조정한다.
+- ALB HTTP 제한은 request line 16 KB, 단일 header 16 KB, 전체 request header 64 KB를 기준으로 확인한다. Nginx/Tomcat에도 허용 크기를 명시하고 큰 쿠키·한글/쿼리 인코딩을 시험한다.
+- 본문 크기는 Nginx `client_max_body_size=1m`부터 검토한다. ALB 연결 WAF의 본문 검사 한도는 8 KB이므로 초과 본문의 oversize handling을 명시하고, 필요한 폼 크기·오탐을 관측해 차단 정책을 확정한다.
+- 긴 작업은 비동기 Job/상태 조회로 분리하고 대용량 파일은 필요 시 S3 presigned URL을 검토한다.
 - 비멱등 폼 POST에 프록시 자동 재시도를 무분별하게 적용하지 않는다. 요청 timeout 뒤 사용자 재전송의 중복 기록도 시험한다.
 
 ## 7. EKS 운영 기본값과 리소스 소유권
@@ -271,14 +305,14 @@ API Gateway, VPC Link, ALB는 같은 AWS 계정에 둔다. VPC Link는 생성 �
 
 | 도구 | 소유 리소스/업무 |
 |---|---|
-| Terraform `foundation` | VPC/SG/endpoint, EKS/MNG/IAM, ECR, RDS, Secrets 메타데이터, Cognito User Pool/client, DNS/ACM, 예산 |
+| Terraform `foundation` | 3계층 VPC/SG/endpoint, EKS/MNG/IAM, ECR, RDS, Secrets 메타데이터, ACM 인증서/DNS 검증, 예산 |
 | Helm/Argo CD `platform` | 컨트롤러·운영 addon, namespace/RBAC 정책 |
 | Helm/Argo CD `workload` | Web/App/Service/Ingress/HPA/PDB/NetworkPolicy/migration Job |
 | AWS Load Balancer Controller | Ingress 선언을 읽고 ALB/listener/target group 실제 생성·조정 |
-| Terraform `edge` | 생성된 listener ARN을 입력받아 VPC Link/API Gateway integration/domain 연결 |
+| Terraform `edge` | LBC가 생성한 ALB ARN/DNS/hosted zone ID를 입력받아 WAF WebACL·association·로그 및 Route 53 A alias 관리 |
 | GitHub Actions | 소스 테스트, 이미지 빌드·스캔·서명, ECR push, 배포 Git의 digest 변경 PR |
 
-**동일 ALB/listener를 Terraform과 LBC가 동시에 소유하지 않는다.** platform/workload reconcile 후 listener ARN을 tag 및 이름으로 조회·검증해 edge 입력에 연결한다. foundation → platform → workload/ALB → edge 순서로 분리하고, ALB 교체 시 listener ARN 변경 및 integration 전환을 명시적으로 처리한다. Terraform state는 암호화·접근 제한·잠금·버전 보관을 적용한다.
+**동일 ALB/listener를 Terraform과 LBC가 동시에 소유하지 않는다.** foundation → platform → workload/ALB → edge 순서로 분리한다. ALB ARN/DNS/hosted zone ID를 tag 및 이름으로 조회·검증해 edge 입력에 연결하고, ALB 교체 시 WAF association과 DNS alias를 함께 갱신한다. WAF association은 Terraform만 소유하며 Ingress의 WAF 연결 annotation과 중복 관리하지 않는다. Terraform state는 암호화·접근 제한·잠금·버전 보관을 적용한다.
 
 GitHub runner가 private EKS API에 직접 접속할 필요 없이 Argo CD가 배포 Git을 pull하도록 한다. 초기 addon 설치·긴급 복구는 VPC 내부 관리 경로를 사용한다. Argo CD UI를 별도 무인증 public LB로 만들지 않는다.
 
@@ -288,8 +322,8 @@ GitHub runner가 private EKS API에 직접 접속할 필요 없이 Argo CD가 �
 
 ```text
 P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-Tier
- → P3 AWS 기반망·IAM·ECR → P4 RDS·Secrets → P5 EKS 플랫폼
- → P6 Web/App·내부 ALB → P7 API Gateway·HTTPS 공개
+ → P3 AWS 기반망(3계층 VPC)·IAM·ECR → P4 RDS·Secrets → P5 EKS 플랫폼
+ → P6 Web/App·RDS·internet-facing ALB → P7 WAF·TLS·도메인·안전한 공개
  → P8 CI/CD → P9 확장·관측 → P10 장애·복구·인수·정리
 ```
 
@@ -298,11 +332,11 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 | 0 | 1 | 자료 검토 | 범위·예산·ADR·버전 선정 원칙 승인 |
 | 1 | 1~2 | P0 | 선택 JVM/Servlet에서 원본 기능 재현 |
 | 2 | 3~4 | P1 | 안전한 초기화·보안·프로브를 갖춘 로컬 3-Tier |
-| 3 | 1~2 | P0, 실제 생성은 P2 확인 후 권장 | private 네트워크·IAM·ECR·IaC 재현 |
+| 3 | 1~2 | P0, 실제 생성은 P2 확인 후 권장 | 3계층 VPC·IAM·ECR·IaC 재현 |
 | 4 | 1~2 | P3 | RDS TLS·migration·백업·최소권한 |
 | 5 | 1~2 | P3 | healthy EKS·addon·접근 통제 |
-| 6 | 1~2 | P2/P4/P5 | 내부 ALB 경유 Web→App→DB, 2 replicas |
-| 7 | 1~2 | P6, 인증 기능 완료 | Gateway 경유 UI/HTTPS/OIDC/차단 검증 |
+| 6 | 1~2 | P2/P4/P5 | 시험 출발지만 허용한 internet-facing ALB 경유 Web→App→DB, 2+ replicas |
+| 7 | 1~2 | P6, 인증 기능 완료 | WAF·도메인 HTTPS·폼 로그인·차단 검증 후 공개 승인 |
 | 8 | 2 | P7 | commit→승인→배포→롤백 재현 |
 | 9 | 1~2 | P8 | HPA/노드 확장·대시보드·알람 |
 | 10 | 2~3 | P9 | 장애·복원·인수 증빙·비용 정리 |
@@ -316,8 +350,8 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 **작업**
 1. PDF/노션 검토 결과, GitHub SHA, 자료의 코드 누락·상충 항목을 출처 문서에 기록한다.
 2. 지역·계정·도메인·팀 역할·예산 상한·환경(dev/prod)을 확정한다.
-3. ADR 작성: HTTP API 선택, MVC 유지, Nginx Web 유지, RDS MySQL, MNG 선택, IaC 소유권, 인증/공유 세션 방식.
-4. 후보 runtime·RDS·Kubernetes/addon 버전의 지원 기간·호환성을 확인하고 버전 잠금 목록을 만든다.
+3. ADR 작성: internet-facing ALB + WAF, 3계층 VPC, MVC/Nginx Web 유지, RDS MySQL 8.4.6, MNG 선택, IaC 소유권, 폼 로그인/DB 계정/공유 세션 방식.
+4. 후보 runtime·RDS·Kubernetes/addon 버전의 지원 기간·호환성을 확인하고 버전 잠금 목록을 만든다. AWS Pricing Calculator로 ALB 시간/LCU와 WAF WebACL 월정액·규칙·100만 요청당 단가를 포함한 서울 리전 견적을 확인한다.
 5. 목표 제안: steady 20 req/s, 15분 측정, 유효 업무 요청 성공률 ≥99%, 동적 GET p95 ≤1초. 읽기 90%/쓰기 10%와 테스트 데이터량을 명시한다. 운영 SLO 99.9%는 후속 목표이며 단기 시험으로 입증했다고 쓰지 않는다.
 
 **산출물:** 요구사항, ADR, 주소/포트표, 버전표, 비용 추정표, 시험 계획.\
@@ -347,7 +381,7 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 1. XML 외부 설정 경로와 운영 initializer 차단을 구현한다. 외부 Secret 누락 시 임의 H2로 fallback하지 않게 한다.
 2. SQL을 migration/선택적 demo seed로 분리하고 별도 migration 실행으로 전환한다.
 3. 전용 live/ready, proxy 인식, 로그 마스킹·request ID, DB pool/timeout 설정을 추가한다.
-4. Spring Security OIDC 연동 접점·역할·CSRF, Spring Session JDBC를 구현한다. 로컬에는 테스트 IdP/테스트 계정으로 검증하고 실제 Cognito 설정은 AWS 단계에서 연결한다.
+4. Spring Security 폼 로그인, DB `users`/`authorities`와 비밀번호 해시, `ROLE_READER`/`ROLE_WRITER`의 URL·HTTP method별 인가, JSP CSRF, Spring Session JDBC를 구현한다. 로컬 테스트 계정으로 권한·쿠키·세션 분산을 검증한다. 인증 구현 전에는 무인증 상태이므로 공개 서비스로 승인하지 않는다.
 5. App은 Maven builder → Tomcat runtime 멀티스테이지, Web은 최소 Nginx 이미지로 만든다. builder 테스트와 runtime smoke를 모두 수행한다.
 6. Dockerfile에 source SHA/base digest, non-root, foreground 실행, `.dockerignore`를 적용한다. 이미지 레이어·환경변수에 비밀을 넣지 않는다.
 7. Compose에서 Web만 localhost 포트 공개, App/DB는 미공개. `web-app`, `app-db` 네트워크를 분리하고 App만 양쪽에 연결한다.
@@ -357,13 +391,13 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 **완료 조건:** 새 환경에서 재현, App 재시작/동시 기동으로 데이터 변경 없음, 무인증 쓰기·CSRF 실패, 비밀 미포함.\
 **실패 대응:** 이미지 이전 digest로 복구. DB는 함부로 `down -v`하지 않고 migration 실패 원인과 백업 상태부터 확인.
 
-### Phase 3 — AWS 기반망·IAM·ECR·예산
+### Phase 3 — AWS 기반망(3계층 VPC)·IAM·ECR·예산
 
-**목표:** IaC로 사설 실행 기반과 권한 경계를 만든다.
+**목표:** IaC로 3계층 VPC와 사설 실행 기반, 권한 경계를 만든다.
 
 **작업**
 1. Terraform state backend/잠금과 CI plan 검토 절차를 먼저 준비한다.
-2. VPC/2 AZ subnet/route/NAT/필요 endpoint/SG/DNS를 생성한다. DB 전용 사설 서브넷은 외부 경로 없이 VPC local 라우팅만 두어 실수로 `PubliclyAccessible=true`가 되어도 인터넷 경로가 열리지 않게 한다.
+2. VPC `10.20.0.0/16`에 §4.1의 Public/Private workloads/Isolated data 3계층·2 AZ의 총 6개 subnet, route, AZ별 NAT 2개, 필요 endpoint/SG/DNS를 생성한다. Public만 IGW를 연결하고 workloads는 같은 AZ NAT를 사용한다. DB 서브넷은 인터넷 기본 경로 없이 VPC local만 둔다.
 3. ECR `petclinic-web`, `petclinic-app`을 private·immutable tag·암호화·scan·lifecycle로 구성한다. BuildKit/buildx가 생성하는 OCI manifest index·플랫폼별 본체·provenance attestation에서 태그가 인덱스에만 붙고 참조된 하위 매니페스트는 untagged 행으로 보일 수 있으므로, 단순 "태그 없는 이미지 즉시 만료" 규칙으로 활성 태그의 하위 참조가 깨지지 않게 설계한다.
 4. 관리/CI/노드/컨트롤러/비밀 접근 역할을 분리한다. GitHub OIDC trust를 repo/environment로 제한한다.
 5. Secrets 메타데이터와 비용 tag(`Project`, `Environment`, `Owner`, `ExpiresAt`)를 정의하고 Budget 알림을 연결한다.
@@ -378,7 +412,7 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 **목표:** App lifecycle과 독립적인 데이터 계층을 확보한다.
 
 **작업**
-1. DB subnet group, encrypted RDS, `publicly_accessible=false`, backup retention을 구성한다. 운영은 Multi-AZ, 삭제 보호와 최종 snapshot 정책을 적용한다.
+1. DB subnet group, encrypted RDS MySQL 8.4.6, `publicly_accessible=false`, backup retention을 구성한다. 운영은 Multi-AZ, 삭제 보호와 최종 snapshot 정책을 적용한다. 버전 제공 여부는 P0 승인 목록을 따른다.
 2. RDS master, migration, runtime DML 계정을 분리하고 비밀을 안전하게 발급한다.
 3. 승인된 VPC 내부 관리 runner에서 RDS TLS/CA·hostname과 migration baseline을 검증한다. EKS migration Job은 P5 이후 P6에서 같은 버전 이력을 이어받는다.
 4. Secrets Manager 값/접근 정책과 XML 파일 주입 계약을 준비한다. **CSI mount 및 실제 App 연결 검증은 P5 완료 후 P6의 선행 gate**로 수행한다.
@@ -403,38 +437,38 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 **완료 조건:** node Ready, addon healthy, 최소권한 접근과 음성 테스트 성공, Pod IP 용량 확인.\
 **실패 대응:** addon 버전 pin 복구·nodegroup 교체 계획. EKS control plane minor downgrade를 롤백 수단으로 가정하지 않는다.
 
-### Phase 6 — Web/App·RDS 연결 및 내부 ALB
+### Phase 6 — Web/App·RDS 연결 및 인터넷-facing ALB
 
-**목표:** Gateway 없이 VPC 내부에서 3-Tier 경로를 완성한다.
+**목표:** 시험 출발지만 허용한 internet-facing ALB에서 Web→App→RDS의 3-Tier 경로를 완성한다.
 
 **작업**
 1. P4의 DB Secret을 migration/App 전용 ServiceAccount로 각각 CSI mount하고 권한·파일 경로를 먼저 검증한다. 실제 non-root UID/GID가 필요한 파일만 읽을 수 있는지 확인하며 root 소유 `0400`을 무조건 복사하지 않는다. CSI 지원 권한 설정·그룹 소유권을 검증하고 rotation 후 파일 갱신과 앱 재로딩/재연결을 각각 확인한다. 비밀 파일 내용이나 전체 env를 로그로 출력하지 않는다. migration Job을 수행한 뒤 성공한 schema version에 대해서만 App sync를 진행한다. 병렬 Job도 migration 도구 잠금으로 제어한다.
 2. ECR digest로 Web/App Deployment와 ClusterIP Services를 배포한다. ConfigMap/Secret 파일, probe, resources, PDB, spread, securityContext를 적용한다.
-3. App replicas 2개에서 같은 RDS와 공유 세션을 사용하도록 한다. datasource 초기화가 다시 실행되지 않는지 확인한다.
-4. LBC Ingress로 **internal ALB**를 생성하고 HTTPS listener/인증서, `target-type=ip`, Web health를 지정한다.
-5. VPC 내부 테스트 runner로 health·정적 파일·미인증 차단·DB 통합시험과 음성 통신을 점검한다. 인증된 기능은 P2의 테스트 IdP 기반 격리 시험으로 회귀 검증하고, 실제 Cognito를 포함하는 전체 브라우저 동선은 P7에서 최종 검증한다. 임시 SG 허용은 만료 후 제거한다.
-6. ALB listener ARN을 검증·내보내 edge stack에 전달한다. App Service를 ALB가 직접 노출하는 우회 rule은 만들지 않는다.
+3. Web/App 각각 replicas 2개 이상을 2 AZ에 배치한다. App은 같은 RDS와 공유 세션을 사용하며 datasource 초기화가 다시 실행되지 않는지 확인한다.
+4. LBC Ingress로 **internet-facing ALB**를 public 서브넷 2개 AZ에 생성하고 HTTPS listener/Regional ACM 인증서, 80→443 redirect, `target-type=ip`, Web 8080/health 8081을 지정한다. P7 승인 전에는 `sg-alb`의 443을 승인된 시험 출발지 CIDR로 제한하고 80도 미개방 또는 같은 범위로 제한한다.
+5. 관리 runner와 승인된 시험 출발지에서 health·정적 파일·폼 로그인·역할·CSRF·DB 통합시험 및 음성 통신을 점검한다. 테스트 계정은 승인된 DB bootstrap으로 생성하며 공용 자격증명을 배포하지 않는다. 전체 도메인 브라우저 동선과 WAF 검증은 P7에서 완료한다.
+6. ALB ARN/DNS/hosted zone ID를 검증·내보내 edge stack에 전달한다. App Service를 ALB가 직접 노출하는 우회 rule은 만들지 않는다.
 
-**산출물:** Helm chart/환경 values, target health 증거, 내부 E2E 보고서, edge 입력값.\
+**산출물:** Helm chart/환경 values, target health 증거, 제한된 출발지 E2E 보고서, edge 입력값.\
 **완료 조건:** 2 AZ 배치와 healthy targets, Web→App→DB 성공, Web→DB 실패, readiness 실패 App의 트래픽 제외.\
 **실패 대응:** Git의 이전 digest/values로 되돌리고 migration 호환성을 먼저 확인. ALB 변경은 controller reconcile과 SG/인증서 상태를 추적한다.
 
-### Phase 7 — API Gateway·TLS·도메인·안전한 공개
+### Phase 7 — WAF·TLS·도메인·안전한 공개
 
-**목표:** 단일 공개 진입점으로 전체 기능을 안전하게 연결한다.
+**목표:** WAF·TLS·도메인과 애플리케이션 인증을 검증한 뒤 공개 접근을 승인한다.
 
 **작업**
-1. 실제 Cognito User Pool/client, 허용 사용자/그룹, callback/logout URI를 구성한다. 공개 self-signup은 업무 요구가 없다면 비활성화한다.
-2. 2개 지원 AZ의 private subnet/SG로 VPC Link를 생성하고 AVAILABLE을 기다린다.
-3. HTTP API·proxy routes·path mapping·ALB listener integration·backend TLS를 생성한다.
-4. regional ACM/Route 53/custom domain을 연결하고 기본 execute-api endpoint를 비활성화한다.
-5. stage 접근 로그·throttle을 설정한다. Web에서 canonical Host/HTTPS 헤더를 정규화한다.
+1. DB 계정·비밀번호 해시·읽기/쓰기 역할·Spring Session JDBC·CSRF·쿠키를 재검증한다. 인증 구현 전에는 무인증 상태이므로 공개 서비스로 승인하지 않는다.
+2. Terraform edge로 Regional WebACL, 관리형 규칙 3종, 5분/IP 2,000 요청 rate rule, `aws_wafv2_web_acl_association`을 구성한다. 시험 출발지 제한을 유지한 채 count로 오탐을 관측하고 승인한 규칙을 block으로 전환한다.
+3. WAF 로그를 CloudWatch Logs(retention 30일), ALB 액세스 로그를 S3(lifecycle 30일)에 연결한다. 요청 본문 미수집·쿠키 마스킹·샘플 수집 비활성화와 차단 로그를 확인한다.
+4. 서울 리전 Regional ACM의 DNS 검증/인증서와 ALB HTTPS 443 listener를 확인하고 Route 53 A alias를 연결한다. HTTP 80은 443 redirect만 허용한다.
+5. Web의 canonical Host/HTTPS·클라이언트 IP 헤더 정규화, App의 HTTPS Location·Secure 쿠키를 확인한다.
 6. 브라우저에서 로그인→보호자/반려동물/방문 등록→검색→로그아웃을 시험한다. redirect·CSS·이미지·JSON/XML·쿠키·한글/쿼리 인코딩도 확인한다.
-7. 비로그인/권한 부족/CSRF/위조 forwarded header/기본 endpoint/직접 ALB 접근을 음성 시험한다.
+7. 미인증/권한 부족/CSRF/위조 forwarded header, 노드·DB 직접 접근, Web→DB 차단 및 SQLi/악성 입력·rate rule 차단을 정상 대조군과 함께 시험한다. 인증·WAF gate 통과 후에만 `sg-alb`의 443을 `0.0.0.0/0`로 확대하고 공개 승인한다. ALB 직접 도메인 경로는 정상 진입점이다.
 
-**산출물:** edge IaC, 라우트/인증 계약, 브라우저 E2E, 도메인/TLS 검증 보고서.\
-**완료 조건:** 승인된 도메인 경로에서 정상 동작, 내부 주소·비밀 미노출, 무인증 데이터 접근/쓰기 차단, Gateway 우회 불가.\
-**실패 대응:** 공개 route/mapping을 차단하거나 이전 integration으로 전환한다. 기존 ALB/listener를 새 integration 검증 전에 삭제하지 않는다.
+**산출물:** edge IaC, WAF/라우팅/인증 계약, 브라우저 E2E, 도메인/TLS·안전한 공개 승인 보고서.\
+**완료 조건:** HTTPS 도메인에서 정상 동작, WAF association·block 동작·로그 확인, 내부 주소·비밀 미노출, 미인증 업무 접근/권한 외 쓰기 차단.\
+**실패 대응:** ALB SG를 시험 출발지 제한으로 복구하거나 listener 업무 전달을 차단한다. DNS 제거만으로 공개 차단을 대신하지 않으며 이전 정상 Ingress/edge 구성을 복구하고 재검증한다.
 
 ### Phase 8 — CI/CD와 릴리스·롤백 자동화
 
@@ -469,7 +503,7 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 **작업**
 1. HPA 2~6, CPU 기준·stabilization·scale-down 정책을 적용하고 요청 부하에서 증가/감소를 확인한다.
 2. Pending Pod 상황에서 Cluster Autoscaler가 대상 MNG를 늘리는지 검증한다. 최대 노드 수와 DB pool 예산을 함께 제한한다.
-3. API Gateway 지표/접근 로그, ALB target/5xx/latency, Web/App 구조화 로그, JVM/GC/pool, EKS node/pod, RDS 지표를 연결한다.
+3. WAF allowed/blocked/rate 지표·로그, ALB target/4xx/5xx/latency·S3 액세스 로그, Web/App 구조화 로그, JVM/GC/pool, EKS node/pod, RDS 지표를 연결한다.
 4. 시작 알람 예: 5xx >1%/5분(최소 요청수 조건), unhealthy target >0/지속, App replica 부족, DB 연결 사용률 >80%, storage 여유 <20%, 반복 OOM. 실제 기준은 baseline으로 튜닝한다.
 5. 개인정보·토큰·쿼리/본문 로깅을 제한하고 로그 retention/수집량/알람 전달을 확인한다.
 6. 요청을 여러 연결로 발생시켜 App 분산을 확인한다. ClusterIP 및 upstream keepalive의 연결 단위 분산을 이해하고 요청 수가 완벽하게 동일해야 한다고 요구하지 않는다.
@@ -499,10 +533,10 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 | ID | 시험 | 통과 기준 | 증빙 |
 |---|---|---|---|
 | T01 | 빌드/런타임 | pinned SHA, Maven 테스트, Tomcat WAR/JSP 정상 | CI log, image digest |
-| T02 | UI end-to-end | Gateway에서 로그인·검색·등록·수정·방문·로그아웃 | 브라우저 기록, DB 확인 |
+| T02 | UI end-to-end | **HTTPS 도메인(ALB)에서** 로그인·검색·등록·수정·방문·로그아웃 | 브라우저 기록, DB 확인 |
 | T03 | HTTP 계약 | root/static/JSON/XML/폼/3xx/쿼리/쿠키 보존 | 응답 헤더·자산·네트워크 기록 |
-| T04 | 경계 차단 | 직접 ALB·노드·DB 접근 실패, Web→DB 실패 | SG/NetworkPolicy 음성 테스트 |
-| T05 | 인증·인가·CSRF | 미인증 차단, 권한 부족 403, CSRF 실패 | 민감값 제거 테스트 로그 |
+| T04 | 경계 차단 | 노드·DB 직접 접근 실패, Web→DB 실패, WAF 차단 규칙 동작(SQLi/악성 입력) 확인 | SG/NetworkPolicy 음성 테스트, WAF block 로그·정상 대조군 |
+| T05 | 인증·인가·CSRF | 미인증 차단, ROLE_READER 쓰기 금지/ROLE_WRITER 허용, 권한 부족 403, CSRF 누락·변조 거부 | 민감값 제거 테스트 로그 |
 | T06 | 초기화/영속성 | App 재생성·동시 기동 후 데이터 유지, DDL 재실행 없음 | migration history, 레코드 비교 |
 | T07 | 세션/배포 | Pod 교체·분산 후 로그인 유지, 이전 버전 복구 가능 | 요청 추적, release 기록 |
 | T08 | 프로브 | DB 장애 시 App ready 실패/live 유지, 복구 후 정상 | kube events, probe 응답 |
@@ -523,29 +557,31 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 |---|---|---|
 | EKS control plane | 1 cluster, 생성 기간 내 계속 과금 | 환경별 cluster 분리 검토, 지원 기간 관리 |
 | Worker | 공유 2노드로 축소 가능, Tier SG 격리 약화 명시 | Web/system 2 + App 2부터 시작, 확장 여유 |
-| NAT | 1개, AZ 장애 의존 허용 | AZ별 1개씩 2개 |
-| ALB/API Gateway | ALB 1개, 전체 UI 요청도 Gateway 과금 | ALB 시간/LCU + HTTP API 요청량/전송량 |
+| NAT | AZ별 1개씩 총 2개, 기간·처리량 축소 | AZ별 1개씩 2개 + 처리 GB |
+| ALB | 1개, 시간 + LCU | ALB 시간 + LCU·전송량 |
+| AWS WAF | WebACL 월정액 + 규칙 요금 + 요청 100만 건당 과금 | 동일 과금 요소 + 규모별 요청량·로그; 정확한 단가는 Phase 0에서 Pricing Calculator로 확인 |
 | RDS | Single-AZ 허용, HA 시험은 별도 | Multi-AZ + backup/storage/I/O |
 | 기타 | ECR, EBS, public IPv4, endpoint ENI, 로그, Secrets, KMS, 도메인 | 같은 항목 + 규모별 사용량 |
 
-월 비용은 `EKS 시간 + EC2 시간 + EBS + RDS + ALB 시간/LCU + NAT 시간/GB + API 요청 + endpoint 시간/GB + 로그/전송/백업/보안 서비스`로 계산한다. NAT와 interface endpoint를 무조건 모두 만드는 것이 더 저렴하지는 않다. 실제 요청량·트래픽 목적지·AZ 간 전송을 기준으로 선택한다.
+월 비용은 `EKS 시간 + EC2 시간 + EBS + RDS + ALB 시간/LCU + WAF WebACL·규칙 월정액/요청 + NAT 시간/GB + endpoint 시간/GB + 로그/전송/백업/보안 서비스`로 계산한다. NAT와 interface endpoint를 무조건 모두 만드는 것이 더 저렴하지는 않다. 실제 요청량·트래픽 목적지·AZ 간 전송을 기준으로 선택한다.
 
 예산 알림은 합의 금액의 50/80/100%로 설정한다. 알림은 자동 비용 상한이 아니다. EKS는 EC2처럼 클러스터를 중지해 control plane 과금을 멈추는 방식이 아니며, 노드 0대만으로 전체 비용이 사라지지 않는다.
 
 ### 10.2 장애 진단 순서
 
-1. API Gateway route/integration 상태, 4xx/5xx, request ID, VPC Link AVAILABLE 확인.
-2. ALB listener/TLS/SG/healthy targets, Web 로그 확인.
+1. Route 53/ACM/ALB listener·WAF 차단 여부 → 4xx/5xx와 요청 추적 정보 확인.
+2. ALB target health/SG, Web 로그 확인.
 3. Web→App DNS/Service/EndpointSlice/readiness/NetworkPolicy 확인.
-4. App 예외/JVM/connection pool/Secret 파일/외부 IdP egress 확인.
+4. App 예외/JVM/connection pool/설정·Secret 파일 확인.
 5. RDS SG/TLS/연결 수/느린 쿼리/failover 이벤트 확인.
 
 | 증상 | 우선 확인 |
 |---|---|
-| Gateway 404 또는 정적 파일 깨짐 | root route, stage prefix, WAR context, asset path |
-| 502/503 | healthy targets, probe, Nginx upstream, App boot, listener ARN |
-| 504 | Gateway 30초 제한, DB/pool/쿼리 timeout, VPC Link/SG |
-| 로그인 redirect loop·HTTP callback | canonical scheme/host, callback URI, 세션/쿠키 |
+| 403 또는 정상 폼 차단 | WAF terminating rule/count·block 로그, Spring Security 역할/CSRF, 정상 대조군 |
+| ALB 404 또는 정적 파일 깨짐 | Host/path rule, Web proxy 경로, WAR root context, asset path |
+| 502/503 | healthy targets, probe, SG, Nginx upstream, App boot |
+| 504 | ALB idle timeout, Web upstream timeout, DB/pool/쿼리 timeout, SG |
+| 로그인 redirect loop·HTTP Location | canonical scheme/host, 폼 로그인 설정, 세션/쿠키 |
 | Pod마다 로그인 상태 다름 | Spring Session 연결·테이블·직렬화, 쿠키 범위 |
 | ImagePullBackOff | ECR IAM, DNS/endpoint/NAT, digest/CPU architecture |
 | OOMKilled/Pending | JVM native 여유, requests/limits, AZ/taint/capacity/IP |
@@ -553,16 +589,17 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 
 ### 10.3 실습 자원 정리 순서
 
-증빙·데이터 보관 승인 → 외부 API route/domain 연결 제거 → Gateway integration/VPC Link 의존 해제 → Argo 자동 sync 중단/정리 대상 확정 → Ingress 삭제 및 **LBC가 ALB/TG 삭제를 완료했는지 확인** → App/addon/nodegroup/cluster 정리 → 승인된 RDS 최종 snapshot 및 DB 삭제 → NAT/endpoint/ENI/SG/VPC 정리 → 필요 없는 ECR/EBS/EIP/로그/Secret/인증 리소스 점검.
+증빙·데이터 보관 승인 및 공개 중단(ALB SG 제한) → Argo 자동 sync 중단/정리 대상 확정 → **WAF association/WebACL 제거**(Terraform edge) → **Ingress 삭제 및 LBC의 ALB/TG 삭제 완료 확인** → Route 53 alias·전용 ACM/edge 잔여 리소스 정리 → App/addon/nodegroup/cluster 정리 → 승인된 RDS 최종 snapshot 및 DB 삭제 → NAT/endpoint/ENI/SG/VPC 정리 → 필요 없는 ECR/EBS/EIP/로그/Secret 점검.
 
 컨트롤러를 먼저 없애 ALB 삭제 finalizer가 고립되지 않도록 한다. retained snapshot·로그·도메인·state·ECR은 별도 과금될 수 있으므로 보관 기한과 소유자를 남긴다. 공유 VPC·공유 IAM·공유 DNS는 프로젝트 전용 자원과 구분한다.
 
 ### 10.4 후속 선택 과제
 
-- **REST API 확장:** `/api/v1/**` CRUD와 OpenAPI를 새로 구현한 뒤 JWT authorizer + App token 검증/인가를 적용한다. 기존 `/vets.json` 하나로 전체 REST 전환을 완료했다고 주장하지 않는다.
-- **CDN/프런트 분리:** 정적 자산만 CloudFront/S3로 옮길지, SPA를 새로 만들지 별도 ADR로 결정한다. Gateway 요청 비용·cache·CORS·인증 영향 검토.
+- **OIDC/외부 IdP:** 폼 로그인·DB 계정의 기본안을 유지하며 외부 조직 계정 연동이 필요할 때 별도 ADR로 선택한다. callback/logout URI, 역할 매핑, egress, 세션·CSRF 영향을 검증한다.
+- **REST API 확장:** `/api/v1/**` CRUD와 OpenAPI를 새로 구현한 뒤 App의 token 검증/인가를 설계한다. 기존 `/vets.json` 하나로 전체 REST 전환을 완료했다고 주장하지 않는다.
+- **CDN/프런트 분리:** 정적 자산만 CloudFront/S3로 옮길지, SPA를 새로 만들지 별도 ADR로 결정한다. 요청·전송 비용·cache·CORS·인증 영향을 검토한다.
 - **카나리:** 기본 rolling release 안정화 이후 Argo Rollouts/지원 라우팅 계층으로 추가한다. Web ALB 가중치만 바꿔도 공통 `app-svc` 뒤 App 버전 비율이 자동 제어되지는 않는다. 버전별 Web/App 경로 또는 App 라우팅 계층까지 설계한다.
-- **강화 운영:** WAF, Security Groups for Pods, Redis 세션/캐시, RDS Proxy, 다중 계정·재해복구는 측정된 필요에 따라 추가한다.
+- **강화 운영:** WAF 규칙 튜닝·추가 규칙, Security Groups for Pods, Redis 세션/캐시, RDS Proxy, 다중 계정·재해복구는 측정된 필요에 따라 추가한다. 기본 WebACL·관리형 규칙은 최초 공개 범위에 포함한다.
 
 ---
 
