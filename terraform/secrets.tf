@@ -102,27 +102,3 @@ resource "aws_secretsmanager_secret_version" "session" {
   secret_string_wo_version = 1
 }
 
-# ── Cognito 앱 클라이언트 자격증명 ──────────────────────────────────────────
-resource "aws_secretsmanager_secret" "cognito" {
-  name        = "${local.name_prefix}/app/cognito"
-  description = "Petclinic Cognito OIDC client credentials"
-  kms_key_id  = aws_kms_key.main.arn
-
-  recovery_window_in_days = 7
-
-  tags = {
-    Name       = "${local.name_prefix}-cognito"
-    SecretType = "oidc"
-  }
-}
-
-resource "aws_secretsmanager_secret_version" "cognito" {
-  secret_id = aws_secretsmanager_secret.cognito.id
-  secret_string_wo = jsonencode({
-    clientId     = aws_cognito_user_pool_client.app.id
-    clientSecret = aws_cognito_user_pool_client.app.client_secret
-    issuerUri    = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.this.id}"
-    userPoolId   = aws_cognito_user_pool.this.id
-  })
-  secret_string_wo_version = 1
-}

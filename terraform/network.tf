@@ -11,7 +11,6 @@ module "network" {
   azs          = var.azs
 
   public_subnet_cidrs   = var.public_subnet_cidrs
-  ingress_subnet_cidrs  = var.ingress_subnet_cidrs
   workload_subnet_cidrs = var.workload_subnet_cidrs
   data_subnet_cidrs     = var.data_subnet_cidrs
 

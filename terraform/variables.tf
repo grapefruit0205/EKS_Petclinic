@@ -58,12 +58,6 @@ variable "public_subnet_cidrs" {
   default     = ["10.20.0.0/24", "10.20.1.0/24"]
 }
 
-variable "ingress_subnet_cidrs" {
-  description = "Private ingress 서브넷 CIDR (internal ALB + VPC Link ENI)"
-  type        = list(string)
-  default     = ["10.20.8.0/24", "10.20.9.0/24"]
-}
-
 variable "workload_subnet_cidrs" {
   description = "Private workloads 서브넷 CIDR (EKS 노드/Pod)"
   type        = list(string)
@@ -258,13 +252,20 @@ variable "db_skip_final_snapshot" {
   default     = false
 }
 
+
 ###############################################################################
-# Cognito
+# AWS WAF (internet-facing ALB 앞단)
 ###############################################################################
-variable "cognito_domain_prefix" {
-  description = "Cognito Hosted UI 도메인 접두사 (전역 유일)"
-  type        = string
-  default     = ""
+variable "waf_rate_limit" {
+  description = "IP당 5분 요청 한도 (rate-based rule)"
+  type        = number
+  default     = 2000
+}
+
+variable "waf_log_retention_days" {
+  description = "WAF 로그 보관 일수"
+  type        = number
+  default     = 30
 }
 
 ###############################################################################

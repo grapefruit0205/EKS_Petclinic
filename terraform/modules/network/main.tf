@@ -6,7 +6,7 @@
 locals {
   az_count = length(var.azs)
 
-  # EKS 서브넷 검색 태그 (설계안: ingress 서브넷만 internal ALB 대상으로 선택)
+  # EKS 서브넷 검색 태그 (public 서브넷이 internet-facing ALB 대상)
   cluster_tag = { "kubernetes.io/cluster/${var.cluster_name}" = "shared" }
 
   public_subnet_tags = merge(local.cluster_tag, {
@@ -34,7 +34,7 @@ resource "aws_internet_gateway" "this" {
 }
 
 ###############################################################################
-# 서브넷 (Public / Private ingress / Private workloads / Isolated data)
+# 서브넷 (Public / Private workloads / Isolated data)
 ###############################################################################
 resource "aws_subnet" "public" {
   count = local.az_count
@@ -46,19 +46,6 @@ resource "aws_subnet" "public" {
 
   tags = merge(var.tags, local.public_subnet_tags, {
     Name = "${var.name_prefix}-public-${var.azs[count.index]}"
-  })
-}
-
-resource "aws_subnet" "ingress" {
-  count = local.az_count
-
-  vpc_id            = aws_vpc.this.id
-  cidr_block        = var.ingress_subnet_cidrs[count.index]
-  availability_zone = var.azs[count.index]
-
-  tags = merge(var.tags, local.private_subnet_tags, {
-    Name = "${var.name_prefix}-ingress-${var.azs[count.index]}"
-    Tier = "ingress"
   })
 }
 
@@ -139,7 +126,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Private(ingress + workload): AZ별 NAT 로 0.0.0.0/0
+# Private workload: AZ별 NAT 로 0.0.0.0/0
 resource "aws_route_table" "private" {
   count = local.az_count
 
@@ -154,13 +141,6 @@ resource "aws_route_table" "private" {
     Name = "${var.name_prefix}-rt-private-${var.azs[count.index]}"
     AZ   = var.azs[count.index]
   })
-}
-
-resource "aws_route_table_association" "ingress" {
-  count = local.az_count
-
-  subnet_id      = aws_subnet.ingress[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
 }
 
 resource "aws_route_table_association" "workload" {

@@ -14,10 +14,6 @@ output "alb_sg_id" {
   value = aws_security_group.alb.id
 }
 
-output "vpclink_sg_id" {
-  value = aws_security_group.vpclink.id
-}
-
 output "rds_sg_id" {
   value = aws_security_group.rds.id
 }

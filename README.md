@@ -111,23 +111,24 @@ VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager,
 .
 ├── README.md
 ├── .gitignore                      # state·tfvars·키 제외
-├── terraform/                      # foundation (61 resources)
+├── terraform/                      # foundation (v2: 3계층 VPC + WAF)
 │   ├── versions.tf providers.tf variables.tf locals.tf
 │   ├── network.tf security.tf kms.tf iam.tf ecr.tf eks.tf rds.tf
-│   ├── oidc.tf secrets.tf cognito.tf dns.tf budget.tf compute.tf
+│   ├── oidc.tf secrets.tf waf.tf dns.tf budget.tf compute.tf
 │   ├── addons.tf outputs.tf
 │   ├── terraform.tfvars.example    # 복사해서 terraform.tfvars 로 사용
 │   ├── modules/{network,security,eks,rds}/
 │   ├── policies/aws-load-balancer-controller-iam-policy.json
 │   └── templates/management-userdata.sh.tftpl
-├── terraform/edge/                 # edge (VPC Link + API Gateway)
-│   ├── versions.tf providers.tf variables.tf main.tf domain.tf outputs.tf
-│   └── terraform.tfvars.example
+├── terraform/dns/                  # v2: ALB → Route 53 A(alias)
+│   └── versions.tf providers.tf variables.tf main.tf outputs.tf
+├── terraform/edge/                 # v1 전용 (폐기 예정)
+│   └── README.md                   # destroy 후 삭제하는 전환 순서
 ├── k8s/
 │   ├── 00-namespace.yaml           # PSA restricted
 │   ├── 10-app.yaml                 # SA(IRSA) + Deployment + Service + PDB
 │   ├── 20-web.yaml                 # Nginx Deployment + Service + PDB
-│   └── 30-ingress.yaml             # internal ALB Ingress
+│   └── 30-ingress.yaml             # internet-facing ALB + WAF Ingress
 ├── app/
 │   ├── Dockerfile                  # Tomcat 11 + ROOT.war, UID 10001
 │   ├── entrypoint.sh               # 외부 설정 파일 강제, fail-fast

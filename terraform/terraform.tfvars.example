@@ -1,4 +1,10 @@
 ###############################################################################
+# 예제 설정 — 이 파일을 terraform.tfvars 로 복사한 뒤 값을 채우세요.
+#   cp terraform.tfvars.example terraform.tfvars
+# 실제 terraform.tfvars 는 .gitignore 로 제외됩니다(ARN·주소 포함).
+###############################################################################
+
+###############################################################################
 # 구축 파라미터 (kdt5 계정 / ap-northeast-2)
 ###############################################################################
 
@@ -8,7 +14,7 @@ name_prefix = "petclinic"
 # 비용 태그 (설계안 Phase 3)
 project     = "petclinic-3tier"
 environment = "dev"
-owner       = "kdt5"
+owner       = "your-name"
 expires_at  = "2026-11-05"
 
 # 네트워크 (설계안 4.1)
@@ -16,7 +22,6 @@ vpc_cidr = "10.20.0.0/16"
 azs      = ["ap-northeast-2a", "ap-northeast-2b"]
 
 public_subnet_cidrs   = ["10.20.0.0/24", "10.20.1.0/24"]
-ingress_subnet_cidrs  = ["10.20.8.0/24", "10.20.9.0/24"]
 workload_subnet_cidrs = ["10.20.32.0/20", "10.20.48.0/20"]
 data_subnet_cidrs     = ["10.20.80.0/24", "10.20.81.0/24"]
 
@@ -46,7 +51,7 @@ db_deletion_protection   = true
 db_skip_final_snapshot   = false
 
 # 도메인 / DNS
-domain_name          = "mission-critical.site"
+domain_name          = "example.com"
 app_subdomain        = "clinic"
 create_hosted_zone   = true
 enable_custom_domain = true

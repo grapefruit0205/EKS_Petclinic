@@ -10,10 +10,6 @@ output "public_subnet_ids" {
   value = aws_subnet.public[*].id
 }
 
-output "ingress_subnet_ids" {
-  value = aws_subnet.ingress[*].id
-}
-
 output "workload_subnet_ids" {
   value = aws_subnet.workload[*].id
 }

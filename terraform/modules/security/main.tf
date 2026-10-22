@@ -1,6 +1,6 @@
 ###############################################################################
 # 보안 그룹 (설계안 4.2)
-#   sg-vpclink -> sg-alb           : TCP 443
+#   인터넷(0.0.0.0/0) -> sg-alb   : TCP 443 (WAF 경유), TCP 80 -> 443 리다이렉트
 #   sg-alb     -> sg-web-node      : TCP 8080(업무), 8081(health)
 #   sg-web-node-> sg-app-node      : TCP 8080
 #   sg-app-node-> sg-rds           : TCP 3306
@@ -39,22 +39,13 @@ resource "aws_security_group" "app_node" {
   })
 }
 
-# ── internal ALB SG ─────────────────────────────────────────────────────────
+# ── internet-facing ALB SG ──────────────────────────────────────────────────
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
-  description = "Internal ALB security group (VPC Link ingress only)"
+  description = "Internet-facing ALB security group (WAF attached)"
   vpc_id      = var.vpc_id
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-alb-sg" })
-}
-
-# ── VPC Link SG ─────────────────────────────────────────────────────────────
-resource "aws_security_group" "vpclink" {
-  name        = "${var.name_prefix}-vpclink-sg"
-  description = "API Gateway VPC Link ENI security group"
-  vpc_id      = var.vpc_id
-
-  tags = merge(var.tags, { Name = "${var.name_prefix}-vpclink-sg" })
 }
 
 # ── RDS SG ──────────────────────────────────────────────────────────────────
@@ -78,25 +69,6 @@ resource "aws_security_group" "management" {
 ###############################################################################
 # 규칙
 ###############################################################################
-
-# sg-vpclink -> sg-alb : 443
-resource "aws_vpc_security_group_ingress_rule" "alb_from_vpclink" {
-  security_group_id            = aws_security_group.alb.id
-  referenced_security_group_id = aws_security_group.vpclink.id
-  from_port                    = 443
-  to_port                      = 443
-  ip_protocol                  = "tcp"
-  description                  = "HTTPS from VPC Link ENI"
-}
-
-resource "aws_vpc_security_group_egress_rule" "vpclink_to_alb" {
-  security_group_id            = aws_security_group.vpclink.id
-  referenced_security_group_id = aws_security_group.alb.id
-  from_port                    = 443
-  to_port                      = 443
-  ip_protocol                  = "tcp"
-  description                  = "HTTPS to internal ALB"
-}
 
 # sg-alb -> sg-web-node : 8080 / 8081
 resource "aws_vpc_security_group_ingress_rule" "web_node_from_alb_8080" {
@@ -264,22 +236,23 @@ resource "aws_vpc_security_group_ingress_rule" "rds_from_management" {
   description                  = "MySQL bootstrap from admin runner"
 }
 
-# ── 1차 구축(HTTP 리스너) 구간: VPC Link -> ALB 80 ─────────────────────────
-# ACM 공인 인증서 발급(NS 위임) 후 HTTPS 443 으로 전환하고 이 규칙은 제거한다.
-resource "aws_vpc_security_group_ingress_rule" "alb_from_vpclink_80" {
-  security_group_id            = aws_security_group.alb.id
-  referenced_security_group_id = aws_security_group.vpclink.id
-  from_port                    = 80
-  to_port                      = 80
-  ip_protocol                  = "tcp"
-  description                  = "HTTP from VPC Link ENI (interim before ACM)"
+# ── 인터넷 -> internet-facing ALB ───────────────────────────────────────────
+# WAF는 SG 계층이 아니라 ALB 앞단에서 요청을 검사한다. SG는 포트/대역만 다룬다.
+resource "aws_vpc_security_group_ingress_rule" "alb_from_internet_443" {
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  description       = "HTTPS from internet (via AWS WAF)"
 }
 
-resource "aws_vpc_security_group_egress_rule" "vpclink_to_alb_80" {
-  security_group_id            = aws_security_group.vpclink.id
-  referenced_security_group_id = aws_security_group.alb.id
-  from_port                    = 80
-  to_port                      = 80
-  ip_protocol                  = "tcp"
-  description                  = "HTTP to internal ALB (interim before ACM)"
+# HTTP 80 은 ALB 리스너에서 443 으로 리다이렉트하기 위해 연다.
+resource "aws_vpc_security_group_ingress_rule" "alb_from_internet_80" {
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+  description       = "HTTP from internet (redirect to 443)"
 }

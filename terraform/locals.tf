@@ -23,6 +23,4 @@ locals {
   # 커스텀 도메인 사용 조건
   custom_domain_enabled = var.enable_custom_domain
 
-  # Cognito Hosted UI 도메인 접두사 (미지정 시 계정 기반 자동 생성)
-  cognito_domain_prefix = var.cognito_domain_prefix != "" ? var.cognito_domain_prefix : "${var.name_prefix}-${local.account_id}"
 }

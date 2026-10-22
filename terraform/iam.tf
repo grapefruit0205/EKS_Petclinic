@@ -123,7 +123,6 @@ resource "aws_iam_policy" "management_secrets" {
           aws_secretsmanager_secret.app.arn,
           aws_secretsmanager_secret.migration.arn,
           aws_secretsmanager_secret.session.arn,
-          aws_secretsmanager_secret.cognito.arn,
         ]
       },
       {

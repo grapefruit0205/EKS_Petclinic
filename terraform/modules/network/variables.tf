@@ -28,11 +28,6 @@ variable "public_subnet_cidrs" {
   type        = list(string)
 }
 
-variable "ingress_subnet_cidrs" {
-  description = "Private ingress 서브넷 CIDR"
-  type        = list(string)
-}
-
 variable "workload_subnet_cidrs" {
   description = "Private workloads 서브넷 CIDR"
   type        = list(string)

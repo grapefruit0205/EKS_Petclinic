@@ -1,13 +1,15 @@
 ###############################################################################
-# internal ALB (AWS Load Balancer Controller)
-#   - VPC Link 가 유일한 외부 진입 경로이고 ALB 는 internal 이다.
+# internet-facing ALB + AWS WAF (설계안 Phase 6·7)
+#   - ALB 가 유일한 외부 진입점이고, 그 앞단에 Regional WAF WebACL 이 붙는다.
 #   - target-type: ip → 실제 데이터는 Web Pod IP 로 전달된다.
+#   - ALB 는 AWS Load Balancer Controller 소유, WebACL 은 Terraform 소유.
+#     연결은 아래 wafv2-acl-arn annotation 으로 LBC 가 수행한다.
 #
-# [현재 상태] mission-critical.site 의 NS 가 Route53 으로 위임되지 않아
-#   ACM 공인 인증서를 발급할 수 없다. 따라서 1차 구축은 HTTP(80) listener 이다.
-#   등록기관에서 NS 위임 후:
-#     1) terraform.tfvars: enable_custom_domain = true 로 ACM 발급
-#     2) 이 파일에 아래 주석의 HTTPS annotation 적용
+#   채워야 할 값:
+#     <PUBLIC_SUBNET_ID_A>,<PUBLIC_SUBNET_ID_B>  terraform output public_subnet_ids
+#     <ALB_SECURITY_GROUP_ID>                    terraform output alb_sg_id
+#     <ACM_CERTIFICATE_ARN>                      terraform output acm_certificate_arn
+#     <WAF_WEB_ACL_ARN>                          terraform output waf_web_acl_arn
 ###############################################################################
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -15,20 +17,27 @@ metadata:
   name: petclinic-web
   namespace: petclinic-dev
   annotations:
-    alb.ingress.kubernetes.io/scheme: internal
+    # ── 진입 방식 ────────────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/subnets: <INGRESS_SUBNET_ID_A>,<INGRESS_SUBNET_ID_B>
+    alb.ingress.kubernetes.io/subnets: <PUBLIC_SUBNET_ID_A>,<PUBLIC_SUBNET_ID_B>
     alb.ingress.kubernetes.io/security-groups: <ALB_SECURITY_GROUP_ID>
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
-    # HTTPS 전환 시:
-    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    # alb.ingress.kubernetes.io/certificate-arn: <ACM ARN>
-    # alb.ingress.kubernetes.io/ssl-redirect: '443'
+
+    # ── TLS: HTTPS 443 + HTTP 80 → 443 리다이렉트 ────────────────────────────
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    alb.ingress.kubernetes.io/certificate-arn: <ACM_CERTIFICATE_ARN>
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # ── AWS WAF 연결 (LBC 가 association 수행) ───────────────────────────────
+    alb.ingress.kubernetes.io/wafv2-acl-arn: <WAF_WEB_ACL_ARN>
+
+    # ── 백엔드/헬스 ──────────────────────────────────────────────────────────
     alb.ingress.kubernetes.io/backend-protocol: HTTP
     alb.ingress.kubernetes.io/healthcheck-path: /health/ready
     alb.ingress.kubernetes.io/healthcheck-port: "8081"
     alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
     alb.ingress.kubernetes.io/success-codes: "200"
+
     alb.ingress.kubernetes.io/group.name: petclinic
     alb.ingress.kubernetes.io/tags: Project=petclinic-3tier,Environment=dev,Owner=kdt5,ManagedBy=aws-load-balancer-controller
 spec:

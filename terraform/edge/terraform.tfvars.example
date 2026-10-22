@@ -1,22 +1,20 @@
 ###############################################################################
-# edge 파라미터
-#   alb_listener_arn 은 AWS Load Balancer Controller 가 만든 internal ALB
-#   listener ARN 이다. Ingress reconcile 후 조회해 채운다.
-#     aws elbv2 describe-listeners --load-balancer-arn <ALB ARN>
+# v1 edge 스택(폐기 예정) 예제
+#   v2 에서는 사용하지 않는다. 자세한 내용은 README.md 참고.
 ###############################################################################
 region      = "ap-northeast-2"
 name_prefix = "petclinic-dev"
 
 project     = "petclinic-3tier"
 environment = "dev"
-owner       = "kdt5"
+owner       = "your-name"
 expires_at  = "2026-11-05"
 
+# Ingress reconcile 후 조회한 ALB listener ARN
 alb_listener_arn = "<ALB_LISTENER_ARN>"
 
 throttling_rate_limit  = 50
 throttling_burst_limit = 100
 
-# ACM 발급 + Route53 NS 위임 후 true 로 전환
-custom_domain_enabled = true
+custom_domain_enabled = false
 acm_certificate_arn   = ""

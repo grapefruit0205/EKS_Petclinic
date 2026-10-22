@@ -23,10 +23,6 @@ output "public_subnet_ids" {
   value = module.network.public_subnet_ids
 }
 
-output "ingress_subnet_ids" {
-  value = module.network.ingress_subnet_ids
-}
-
 output "workload_subnet_ids" {
   value = module.network.workload_subnet_ids
 }
@@ -42,10 +38,6 @@ output "nat_public_ips" {
 # ── 보안 그룹 ───────────────────────────────────────────────────────────────
 output "alb_sg_id" {
   value = module.security.alb_sg_id
-}
-
-output "vpclink_sg_id" {
-  value = module.security.vpclink_sg_id
 }
 
 output "web_node_sg_id" {
@@ -126,25 +118,7 @@ output "secret_arns" {
     app       = aws_secretsmanager_secret.app.arn
     migration = aws_secretsmanager_secret.migration.arn
     session   = aws_secretsmanager_secret.session.arn
-    cognito   = aws_secretsmanager_secret.cognito.arn
   }
-}
-
-# ── Cognito ────────────────────────────────────────────────────────────────
-output "cognito_user_pool_id" {
-  value = aws_cognito_user_pool.this.id
-}
-
-output "cognito_client_id" {
-  value = aws_cognito_user_pool_client.app.id
-}
-
-output "cognito_domain" {
-  value = "https://${aws_cognito_user_pool_domain.this.domain}.auth.${var.region}.amazoncognito.com"
-}
-
-output "cognito_issuer_uri" {
-  value = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.this.id}"
 }
 
 # ── DNS ────────────────────────────────────────────────────────────────────
@@ -187,4 +161,13 @@ output "acm_validation_records" {
       value = one(r.records)
     }
   ]
+}
+
+# ── WAF (internet-facing ALB 앞단) ─────────────────────────────────────────
+output "waf_web_acl_arn" {
+  value = aws_wafv2_web_acl.alb.arn
+}
+
+output "waf_log_group" {
+  value = aws_cloudwatch_log_group.waf.name
 }
