@@ -39,7 +39,8 @@ metadata:
     alb.ingress.kubernetes.io/success-codes: "200"
 
     alb.ingress.kubernetes.io/group.name: petclinic
-    alb.ingress.kubernetes.io/tags: Project=petclinic-3tier,Environment=dev,Owner=kdt5,ManagedBy=aws-load-balancer-controller
+    #   LBC 가 만드는 ALB·TargetGroup 에도 비용 태그를 모두 붙인다.
+    alb.ingress.kubernetes.io/tags: Project=petclinic-3tier,Environment=dev,Owner=kdt5,ExpiresAt=2026-11-05,ManagedBy=aws-load-balancer-controller,Stack=workload
 spec:
   ingressClassName: alb
   rules:
