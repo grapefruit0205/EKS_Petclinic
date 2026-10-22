@@ -3,7 +3,8 @@
 > Spring Petclinic(Spring MVC/JSP)을 **API Gateway → VPC Link V2 → internal ALB → Nginx Web → Tomcat App → RDS MySQL** 구조로 AWS에 올린 실제 구축 결과입니다.
 > 설계 문서와 Terraform 코드, Kubernetes 매니페스트, 컨테이너 빌드 정의를 함께 담았습니다.
 
-![topology](docs/아키텍처_토폴로지.drawio)
+> **토폴로지 다이어그램**: [`docs/아키텍처_토폴로지.drawio`](docs/아키텍처_토폴로지.drawio) — [draw.io](https://app.diagrams.net) 또는 VS Code Draw.io 확장으로 엽니다.
+> (`.drawio`는 XML이라 GitHub에서 이미지로 렌더링되지 않습니다.)
 
 ---
 
