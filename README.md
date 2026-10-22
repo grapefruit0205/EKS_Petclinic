@@ -1,0 +1,353 @@
+# EKS_Petclinic — API Gateway · EKS 기반 3-Tier 구축
+
+> Spring Petclinic(Spring MVC/JSP)을 **API Gateway → VPC Link V2 → internal ALB → Nginx Web → Tomcat App → RDS MySQL** 구조로 AWS에 올린 실제 구축 결과입니다.
+> 설계 문서와 Terraform 코드, Kubernetes 매니페스트, 컨테이너 빌드 정의를 함께 담았습니다.
+
+![topology](docs/아키텍처_토폴로지.drawio)
+
+---
+
+## 1. 무엇을 만들었나
+
+```text
+사용자 브라우저
+   │ HTTPS 443  (clinic.<도메인>)
+   ▼
+Route 53 ── ACM 인증서
+   │
+   ▼
+API Gateway HTTP API  (Regional, $default stage, 50 rps / burst 100)
+   │ HTTP_PROXY · VPC_LINK · payload 1.0
+   ▼
+VPC Link V2  (private ingress 서브넷 2개 AZ)
+   │
+   ▼
+internal ALB  (target-type=ip)
+   │
+   ▼
+┌──────────────────────── VPC 10.20.0.0/16 ────────────────────────┐
+│  Tier 1  Nginx Web      ×2  (8080 업무 / 8081 health)            │
+│  Tier 2  Tomcat App     ×2  (Spring MVC · JSP · JDK21)           │
+│  Tier 3  RDS MySQL 8.4.6    (Multi-AZ · isolated data 서브넷)     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **애플리케이션 외부 진입점은 API Gateway 하나뿐**입니다. ALB는 `internal`이라 인터넷에서 직접 닿지 않습니다.
+- 원본 Petclinic의 JSP/폼 UI를 그대로 유지합니다. REST/SPA로 재작성하지 않았습니다.
+- `ingress-nginx`는 사용하지 않고 **AWS Load Balancer Controller**로 ALB를 선언적으로 관리합니다.
+
+---
+
+## 2. 실제 동작 확인 결과
+
+구축 후 실측한 값입니다.
+
+| 항목 | 결과 |
+|---|---|
+| `GET /` | **200** — `<title>PetClinic :: a Spring Framework demonstration</title>` |
+| `GET /vets.json` | **200** — RDS 실제 데이터 반환 |
+| `GET /vets.xml` · `/owners/find` · 정적 CSS | **200** |
+| TLS 인증서 | **ISSUED** (CN = `clinic.<도메인>`, ACM, 검증 통과) |
+| VPC Link V2 | **AVAILABLE** |
+| internal ALB 타깃 | Web Pod 2개 **healthy** |
+| EKS 클러스터 / 노드그룹 | **ACTIVE** / `web-system`·`app` 모두 **ACTIVE** |
+| Pod | `app` 2/2, `web` 2/2 **Running** |
+| RDS | **available**, Multi-AZ `true`, `PubliclyAccessible=false`, 암호화 `true` |
+| Web 8080 `/health/*` | **404** (업무 포트로 health 미노출) |
+| Web 8081 `/health/ready` | **200 `ok`** |
+
+---
+
+## 3. 구성 요소
+
+### 네트워크 — 4계층 서브넷
+
+| 계층 | CIDR (AZ-a / AZ-b) | 용도 |
+|---|---|---|
+| Public | `10.20.0.0/24` / `10.20.1.0/24` | Internet Gateway, **AZ별 NAT Gateway 2개**. 워커·DB 미배치 |
+| Private ingress | `10.20.8.0/24` / `10.20.9.0/24` | internal ALB + VPC Link ENI |
+| Private workloads | `10.20.32.0/20` / `10.20.48.0/20` | EKS 노드 / VPC CNI Pod IP |
+| Isolated data | `10.20.80.0/24` / `10.20.81.0/24` | RDS. **인터넷 기본 경로 없음(VPC local 라우팅만)** |
+
+VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager, logs, eks-auth, ssm, ssmmessages, ec2messages)
+
+### 컴퓨트 · 데이터
+
+| 리소스 | 사양 |
+|---|---|
+| EKS | Kubernetes **1.34**, **private endpoint 전용**, control plane 로그(api/audit/authenticator) |
+| Managed Node Group | `web-system` 2대 / `app` 2대 (`m6i.large`, AL2023, gp3 30GiB, IMDSv2, 비-root) |
+| addon | vpc-cni(**NetworkPolicy ON**), kube-proxy, coredns, eks-pod-identity-agent, aws-ebs-csi-driver |
+| RDS | MySQL **8.4.6**, `db.m6g.large`, **Multi-AZ**, 100GiB gp3, 백업 7일, 삭제 보호 |
+| ECR | `petclinic-app`, `petclinic-web` — **IMMUTABLE** 태그, KMS 암호화, scan-on-push, lifecycle |
+
+### 보안 · 비밀
+
+| 항목 | 방식 |
+|---|---|
+| 노드 IAM | worker + CNI + ECR read + SSM. **DB 비밀 읽기 권한은 주지 않음** |
+| IRSA | 5개 역할 분리 — `lbc`, `ebs-csi`, `cluster-autoscaler`, `app`, `migration` |
+| DB 마스터 | **RDS 관리형 Secret** (Terraform state에 평문 없음) |
+| 앱/마이그레이션 계정 | `ephemeral` + write-only 인자 → Secrets Manager. **state 평문 없음(검증 완료)** |
+| EKS 시크릿 | KMS `alias/<prefix>-main` 로 envelope encryption |
+| 관리 접근 | 관리 EC2(**public IP 없음, SSH 키 없음**) + **SSM Session Manager** |
+| Pod 보안 | namespace PSA **restricted**, non-root, seccomp RuntimeDefault, capability drop |
+
+---
+
+## 4. 저장소 구조
+
+```text
+.
+├── README.md
+├── .gitignore                      # state·tfvars·키 제외
+├── terraform/                      # foundation (61 resources)
+│   ├── versions.tf providers.tf variables.tf locals.tf
+│   ├── network.tf security.tf kms.tf iam.tf ecr.tf eks.tf rds.tf
+│   ├── oidc.tf secrets.tf cognito.tf dns.tf budget.tf compute.tf
+│   ├── addons.tf outputs.tf
+│   ├── terraform.tfvars.example    # 복사해서 terraform.tfvars 로 사용
+│   ├── modules/{network,security,eks,rds}/
+│   ├── policies/aws-load-balancer-controller-iam-policy.json
+│   └── templates/management-userdata.sh.tftpl
+├── terraform/edge/                 # edge (VPC Link + API Gateway)
+│   ├── versions.tf providers.tf variables.tf main.tf domain.tf outputs.tf
+│   └── terraform.tfvars.example
+├── k8s/
+│   ├── 00-namespace.yaml           # PSA restricted
+│   ├── 10-app.yaml                 # SA(IRSA) + Deployment + Service + PDB
+│   ├── 20-web.yaml                 # Nginx Deployment + Service + PDB
+│   └── 30-ingress.yaml             # internal ALB Ingress
+├── app/
+│   ├── Dockerfile                  # Tomcat 11 + ROOT.war, UID 10001
+│   ├── entrypoint.sh               # 외부 설정 파일 강제, fail-fast
+│   ├── Dockerfile.web              # nginx 1.29-alpine, UID 101
+│   └── nginx.conf                  # 8080 업무 / 8081 health 분리
+├── diagrams/
+│   └── build_topology.mjs          # drawio-ai-kit 로 토폴로지 재생성
+└── docs/
+    ├── API_Gateway_EKS_3Tier_Phase_설계안.md
+    ├── 구축_결과.md
+    ├── 보류항목_추가구현_계획.md
+    ├── 자료_검토_및_출처.md
+    ├── 노션_페이지_확인_목록.md
+    ├── 00_문서_안내.md
+    └── 아키텍처_토폴로지.drawio
+```
+
+---
+
+## 5. 사전 요구사항
+
+| 도구 | 검증한 버전 |
+|---|---|
+| Terraform | **1.17.0** (AWS provider 6.70.0) |
+| AWS CLI | 2.36.32 |
+| kubectl | 1.36.5 |
+| Helm | 3.19.0 |
+| Docker | 29.1.3 |
+| JDK | Temurin **21** |
+| session-manager-plugin | 1.2.896.0 |
+
+빌드 도구: Maven 3.9.16(wrapper), Tomcat **11.0.18**, nginx **1.29-alpine**
+
+---
+
+## 6. 배포 절차
+
+### 6-1. 변수 파일 준비
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+#   region / cluster_name / 도메인 / DB 사양 / 태그를 환경에 맞게 수정
+
+cd edge
+cp terraform.tfvars.example terraform.tfvars
+#   alb_listener_arn 은 Ingress reconcile 후 조회해 채운다(6-5 참고)
+```
+
+### 6-2. foundation 배포 (약 35~45분)
+
+```bash
+cd terraform
+terraform init
+terraform apply          # VPC·EKS·RDS Multi-AZ 생성
+```
+
+### 6-3. 클러스터 접근 (private endpoint)
+
+EKS API가 private이므로 관리 EC2를 경유해 SSM 포트포워딩을 사용합니다.
+
+```bash
+# 관리 인스턴스 ID 확인
+aws ec2 describe-instances --filters "Name=tag:Name,Values=*management*" \
+  --query 'Reservations[].Instances[].InstanceId' --output text
+
+# 로컬 6443 → EKS API 443
+aws ssm start-session --target <INSTANCE_ID> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["<CLUSTER_ENDPOINT_HOST>"],"portNumber":["443"],"localPortNumber":["6443"]}'
+```
+
+kubeconfig은 `server: https://127.0.0.1:6443` + `tls-server-name: <CLUSTER_ENDPOINT_HOST>` 조합으로 만듭니다.
+
+### 6-4. 플랫폼 addon
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system --set clusterName=<CLUSTER> --set region=<REGION> --set vpcId=<VPC_ID> \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=<LBC_ROLE_ARN>" \
+  --set replicaCount=2 --wait
+
+helm upgrade --install metrics-server metrics-server/metrics-server \
+  -n kube-system --set args[0]=--kubelet-insecure-tls --set replicas=2 --wait
+```
+
+### 6-5. 이미지 빌드 · 푸시
+
+```bash
+# 원본 Petclinic 소스에서
+./mvnw -B -P MySQL clean package -DskipTests     # target/petclinic.war
+
+docker build -f app/Dockerfile     -t <ECR>/petclinic-app:<TAG> .
+docker build -f app/Dockerfile.web -t <ECR>/petclinic-web:<TAG> .
+
+aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ECR>
+docker push <ECR>/petclinic-app:<TAG>
+docker push <ECR>/petclinic-web:<TAG>
+```
+
+### 6-6. DB 부트스트랩
+
+관리 EC2에서 Secrets Manager의 앱/마이그레이션 자격증명을 읽어 계정과 스키마를 만듭니다.
+
+```sql
+CREATE DATABASE IF NOT EXISTS petclinic CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'petclinic_app'@'%'      IDENTIFIED BY '<app-pw>';
+CREATE USER IF NOT EXISTS 'petclinic_migrator'@'%' IDENTIFIED BY '<migrator-pw>';
+GRANT SELECT, INSERT, UPDATE, DELETE ON petclinic.* TO 'petclinic_app'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES
+      ON petclinic.* TO 'petclinic_migrator'@'%';
+```
+
+이후 `schema.sql` / `data.sql`을 **migration 계정으로 1회** 적용합니다(멱등).
+
+### 6-7. 워크로드 · Ingress · edge
+
+```bash
+kubectl apply -f k8s/00-namespace.yaml
+
+# 앱 설정 파일(외부 주입) — 실제 값은 Secrets Manager에서 가져온다
+kubectl -n petclinic-dev create secret generic app-config \
+  --from-literal=data-access.properties="$(cat data-access.properties)"
+
+kubectl apply -f k8s/10-app.yaml -f k8s/20-web.yaml
+
+# internal ALB subnet / SG 채운 뒤
+kubectl apply -f k8s/30-ingress.yaml
+
+# LBC가 만든 listener ARN 확인 → terraform/edge/terraform.tfvars 에 입력
+aws elbv2 describe-listeners --load-balancer-arn <ALB_ARN> --query 'Listeners[].ListenerArn' --output text
+cd terraform/edge && terraform init && terraform apply
+```
+
+### 6-8. 커스텀 도메인 (선택)
+
+1. Route53 호스티드 존 생성 후 **등록기관에서 NS 위임**
+2. `terraform/terraform.tfvars`: `enable_custom_domain = true` → ACM DNS 검증
+3. `terraform/edge/terraform.tfvars`: `custom_domain_enabled = true` → 커스텀 도메인 + A(alias) 레코드
+
+---
+
+## 7. 원본 소스에서 고친 것
+
+원본 [spring-petclinic/spring-framework-petclinic](https://github.com/spring-petclinic/spring-framework-petclinic) 을 그대로 컨테이너화하면 동작하지 않는 지점이 있어 아래를 수정했습니다. **원본 저장소는 변경하지 않았습니다.**
+
+| # | 문제 | 수정 |
+|---|---|---|
+| 1 | `MySQL` 프로파일이 `mysql:mysql-connector-java:8.1.0` 참조 → Maven Central에 없음(좌표 변경됨) | `com.mysql:mysql-connector-j:9.4.0` |
+| 2 | **Maven 리소스 필터링이 Spring XML의 `${jdbc.url}`을 빌드 시점에 `localhost`로 치환** → 어떤 외부 설정도 적용 불가 | `*.xml`을 filtering 대상에서 제외 |
+| 3 | `business-config.xml`에 classpath 설정을 보는 placeholder가 중복 존재 | 외부 파일(`file:/etc/petclinic/...`)로 통일 |
+| 4 | 기동마다 `jdbc:initialize-database`가 스키마/시드 실행 → replica마다 중복 | `noop.sql`(`SELECT 1;`)로 startup 초기화 차단 |
+| 5 | Secret 미주입 시 classpath 기본값(localhost)으로 조용히 기동 | entrypoint에서 설정 파일 부재 시 **exit 1** (fail-fast) |
+| 6 | 셸 특수문자 포함 DB 비밀번호가 `catalina.sh`의 `eval`을 깨뜨림 | 비밀번호를 셸 옵션이 아니라 **파일**로만 전달 |
+| 7 | 공식 Tomcat 이미지에 비-root 사용자 없음 | UID/GID 10001 생성, 쓰기 경로 소유권 부여 |
+
+---
+
+## 8. 보안 · 비밀 관리 원칙
+
+- **비밀은 이미지·Git·Terraform state에 넣지 않습니다.**
+  앱 자격증명은 `ephemeral` + write-only 인자로 Secrets Manager에 기록하고, 마스터는 RDS 관리형 Secret을 씁니다.
+- 런타임 설정은 `/etc/petclinic/data-access.properties` **파일로만** 주입하며, 없으면 기동을 거부합니다.
+- `.gitignore`가 `*.tfstate*`, `terraform.tfvars`, `*.pem`, `*.key`, `kubeconfig` 등을 제외합니다.
+  **이 저장소의 `*.tfvars.example` 은 플레이스홀더만 담고 있습니다.**
+- 저장소에 포함된 매니페스트의 `<...>` 자리표시자는 실제 환경 값으로 바꿔 사용하세요.
+
+> ⚠️ 이 저장소의 코드는 **학습·데모 목적**입니다. 운영에 사용할 경우 Terraform state를 S3+DynamoDB로 이전하고, 인증(아래 9번)을 먼저 적용하세요.
+
+---
+
+## 9. 아직 구현하지 않은 것
+
+`docs/보류항목_추가구현_계획.md`에 항목별 선행조건·구현 방법·완료 판정 기준을 정리해 두었습니다.
+
+| ID | 항목 | 상태 |
+|---|---|---|
+| D1 | HTTPS · 커스텀 도메인 | ✅ 완료 (ACM ISSUED, `clinic.<도메인>` 200) |
+| D2 | NetworkPolicy default-deny | 미적용 (VPC CNI 기능은 ON) |
+| D3 | migration Job | 관리 EC2에서 1회 적용 (Job화 미완) |
+| D4 | 앱 `/health/live`·`/ready` | 미구현 (`/`·TCP probe로 대체 중) |
+| D5 | HPA + Cluster Autoscaler | metrics-server만 설치, IRSA 역할 준비됨 |
+| D6 | **Cognito OIDC 인증·인가·CSRF·공유 세션** | **미구현 — UI가 무인증 상태이므로 공개 서비스로 사용 금지** |
+| D7 | Secrets Store CSI Driver | K8s Secret 파일 마운트로 대체 중 |
+| D8 | 부하·장애·복구 시험 | 미수행 |
+| D9 | Terraform state 원격화 | 로컬 state |
+
+---
+
+## 10. 비용 주의
+
+이 구성은 **실제 과금되는 리소스**를 만듭니다. EKS control plane, 노드 4대, **RDS Multi-AZ**, NAT Gateway 2개, interface VPC endpoint 9개, internal ALB, API Gateway, CloudWatch Logs, ECR, KMS가 계속 과금됩니다.
+
+- 모든 리소스에 `Project / Environment / Owner / ExpiresAt` 태그를 부여합니다(`terraform.tfvars`에서 설정).
+- Budget 알림은 **자동 비용 상한이 아닙니다.**
+- 실습 후에는 `docs/구축_결과.md` 7장의 순서대로 정리하세요.
+  Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → edge destroy → foundation destroy.
+
+```bash
+cd terraform/edge && terraform destroy
+cd .. && terraform destroy     # RDS deletion_protection / 최종 스냅샷 정책 먼저 확인
+```
+
+---
+
+## 11. 문서
+
+| 문서 | 내용 |
+|---|---|
+| [설계안](docs/API_Gateway_EKS_3Tier_Phase_설계안.md) | 아키텍처·네트워크·인증·DB 계약, Phase 0~10, 인수 테스트 14개, 비용·정리 |
+| [구축 결과](docs/구축_결과.md) | 실제 생성 리소스, 검증 결과, 설계와 다르게 적용한 부분, 해결한 장애, 재현 절차 |
+| [보류 항목 추가 구현 계획](docs/보류항목_추가구현_계획.md) | 미구현 9개 항목의 구현 방법·완료 판정·위험 |
+| [자료 검토 및 출처](docs/자료_검토_및_출처.md) | 참고 자료와 실제 소스의 차이, 적용·제외 판단 |
+| [아키텍처 토폴로지](docs/아키텍처_토폴로지.drawio) | draw.io 다이어그램 (다이어그램 편집기로 열기) |
+
+토폴로지 재생성:
+
+```bash
+npm i drawio-ai-kit
+npx drawio-ai run diagrams/build_topology.mjs
+```
+
+---
+
+## 12. 참고
+
+- 애플리케이션: [spring-petclinic/spring-framework-petclinic](https://github.com/spring-petclinic/spring-framework-petclinic) (Spring Framework 7 기반 JSP MVC WAR)
+- 다이어그램: [sparklabx/drawio-ai-kit](https://github.com/sparklabx/drawio-ai-kit)
+- `ingress-nginx`는 2026년 3월 유지보수 종료 공지에 따라 사용하지 않았습니다.
