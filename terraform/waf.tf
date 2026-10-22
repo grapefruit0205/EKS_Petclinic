@@ -10,7 +10,7 @@
 
 resource "aws_wafv2_web_acl" "alb" {
   name        = "${local.name_prefix}-alb-waf"
-  description = "WAF for the internet-facing ALB (petclinic 3-tier)"
+  description = "WAF for the internet-facing ALB - petclinic 3-tier"
   scope       = "REGIONAL"
 
   default_action {

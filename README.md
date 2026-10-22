@@ -3,10 +3,10 @@
 > Spring Petclinic(Spring MVC/JSP)을 **internet-facing ALB + AWS WAF → Nginx Web → Tomcat App → RDS MySQL** 구조로 AWS에 올리는 프로젝트입니다.
 > Terraform 코드, Kubernetes 매니페스트, 컨테이너 빌드 정의, 설계·구축 문서를 함께 담았습니다.
 
-> **v2 개정 (2026-10-22)**: API Gateway HTTP API · VPC Link V2 · internal ALB · Cognito를 **제거**하고 **internet-facing ALB + AWS WAF** 직접 진입으로 전환했습니다. VPC는 4계층 → **3계층**(public / private workloads / isolated data)으로 축소됩니다.
-> 이 저장소의 Terraform·매니페스트는 아직 **v1(API Gateway) 기준**이며, v2 전환 절차는 [`docs/보류항목_추가구현_계획.md`](docs/보류항목_추가구현_계획.md) 의 D1에 정리했습니다.
+> **v2 전환 완료 (2026-10-22)**: API Gateway HTTP API · VPC Link V2 · internal ALB · Cognito를 **제거**하고 **internet-facing ALB + AWS WAF** 직접 진입으로 전환했으며, **실제 AWS에 적용·검증까지 마쳤습니다.**
+> VPC는 4계층 → **3계층**(public / private workloads / isolated data)으로 축소했습니다. 전환 이력은 [`docs/구축_결과.md`](docs/구축_결과.md) 0장에 있습니다.
 
-> **토폴로지 다이어그램**: [`docs/아키텍처_토폴로지.drawio`](docs/아키텍처_토폴로지.drawio) — v1 스냅샷입니다. [draw.io](https://app.diagrams.net) 또는 VS Code Draw.io 확장으로 엽니다.
+> **토폴로지 다이어그램**: [`docs/아키텍처_토폴로지.drawio`](docs/아키텍처_토폴로지.drawio) — **v2 기준**(internet-facing ALB + AWS WAF, 3계층 VPC)입니다. [draw.io](https://app.diagrams.net) 또는 VS Code Draw.io 확장으로 엽니다.
 > (`.drawio`는 XML이라 GitHub에서 이미지로 렌더링되지 않습니다.)
 
 ---
@@ -37,9 +37,24 @@ internet-facing ALB  (public 서브넷 2개 AZ)
 
 ---
 
-## 2. v1 실제 동작 확인 결과 (실측)
+## 2. 실제 동작 확인 결과 (실측)
 
-구축 후 실측한 값입니다.
+### v2 — 현재 배포 (2026-10-22 컷오버)
+
+| 항목 | 결과 |
+|---|---|
+| `GET https://clinic.<도메인>/` | **200** — `<title>PetClinic :: a Spring Framework demonstration</title>` |
+| `GET /vets.json` | **200** — RDS 실제 데이터 반환 |
+| `GET http://clinic.<도메인>/` | **301** → `https://clinic.<도메인>:443/` |
+| TLS 인증서 | **ISSUED** (CN = `clinic.<도메인>`, ACM, 유효기간 2026-10-22 ~ 2027-05-07) |
+| ALB | **internet-facing**, public 서브넷 2개, 타깃 **2/2 healthy** |
+| WAF 연결 | `GetWebACLForResource` → `petclinic-dev-alb-waf` **연결 확인** |
+| WAF 차단 | SQLi · XSS · Log4Shell → **403** / 정상 `GET /vets.json` → **200** |
+| WAF 로그 | `aws-waf-logs-petclinic-dev` 에 `BLOCK` 이벤트 기록 |
+| Pod | `app` 2/2, `web` 2/2 **Running** |
+| RDS | **available**, Multi-AZ `true`, `PubliclyAccessible=false`, 암호화 `true` |
+
+### v1 — 구축 이력 (API Gateway + VPC Link V2)
 
 | 항목 | 결과 |
 |---|---|
@@ -67,7 +82,7 @@ internet-facing ALB  (public 서브넷 2개 AZ)
 | Private workloads | `10.20.32.0/20` / `10.20.48.0/20` | EKS 노드 / VPC CNI Pod IP |
 | Isolated data | `10.20.80.0/24` / `10.20.81.0/24` | RDS. **인터넷 기본 경로 없음(VPC local 라우팅만)** |
 
-> v1의 `Private ingress 10.20.8.0/24 · 10.20.9.0/24` 는 VPC Link ENI 전용이었고 **v2에서 제거**됩니다.
+> v1의 `Private ingress 10.20.8.0/24 · 10.20.9.0/24` 는 VPC Link ENI 전용이었고 **v2에서 제거했습니다**(서브넷·라우팅 연결 삭제 완료).
 
 VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager, logs, eks-auth, ssm, ssmmessages, ec2messages)
 
@@ -122,13 +137,14 @@ VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager,
 │   └── templates/management-userdata.sh.tftpl
 ├── terraform/dns/                  # v2: ALB → Route 53 A(alias)
 │   └── versions.tf providers.tf variables.tf main.tf outputs.tf
-├── terraform/edge/                 # v1 전용 (폐기 예정)
-│   └── README.md                   # destroy 후 삭제하는 전환 순서
+├── terraform/edge/                 # v1 전용 (destroy 완료 — 10개 리소스 삭제)
+│   └── README.md                   # 전환 순서 기록
 ├── k8s/
 │   ├── 00-namespace.yaml           # PSA restricted
 │   ├── 10-app.yaml                 # SA(IRSA) + Deployment + Service + PDB
 │   ├── 20-web.yaml                 # Nginx Deployment + Service + PDB
-│   └── 30-ingress.yaml             # internet-facing ALB + WAF Ingress
+│   ├── 30-ingress.yaml             # internet-facing ALB + WAF Ingress (플레이스홀더)
+│   └── render-ingress.sh           # 플레이스홀더 → terraform output 실제값 치환
 ├── app/
 │   ├── Dockerfile                  # Tomcat 11 + ROOT.war, UID 10001
 │   ├── entrypoint.sh               # 외부 설정 파일 강제, fail-fast
@@ -173,9 +189,7 @@ cd terraform
 cp terraform.tfvars.example terraform.tfvars
 #   region / cluster_name / 도메인 / DB 사양 / 태그를 환경에 맞게 수정
 
-cd edge
-cp terraform.tfvars.example terraform.tfvars
-#   alb_listener_arn 은 Ingress reconcile 후 조회해 채운다(6-5 참고)
+# v1 전용이던 terraform/edge (VPC Link + API Gateway) 는 v2에서 폐기·destroy 완료했다. 6-8 참고.
 ```
 
 ### 6-2. foundation 배포 (약 35~45분)
@@ -259,23 +273,26 @@ kubectl -n petclinic-dev create secret generic app-config \
 
 kubectl apply -f k8s/10-app.yaml -f k8s/20-web.yaml
 
-# Ingress: scheme=internet-facing, public 서브넷, ACM 인증서, 80→443 리다이렉트
-kubectl apply -f k8s/30-ingress.yaml
+# Ingress: scheme=internet-facing, public 서브넷, ACM 인증서, WAF annotation, 80→443 리다이렉트
+#   공개 저장소에는 계정 ID 가 들어간 ACM/WAF ARN 을 둘 수 없으므로 플레이스홀더를 렌더링해서 적용한다.
+./k8s/render-ingress.sh                        # → k8s/30-ingress.rendered.yaml 생성
+kubectl apply -f k8s/30-ingress.rendered.yaml
 ```
 
 > v1에서는 internal ALB 뒤에 `terraform/edge`(VPC Link V2 + API Gateway HTTP API)를 추가로 배포했습니다.
-> **v2에서는 `terraform/edge`를 폐기**하고 ALB가 곧 외부 진입점이 됩니다.
+> **v2에서는 `terraform/edge`를 폐기(destroy 완료)** 했고 ALB가 곧 외부 진입점입니다.
 
-### 6-8. WAF 연결 · 커스텀 도메인 (v2)
+### 6-8. WAF 연결 · 커스텀 도메인 (v2) — **2026-10-22 완료**
 
-1. Route53 호스티드 존 생성 후 **등록기관에서 NS 위임**
-2. `terraform/terraform.tfvars`: `enable_custom_domain = true` → ACM DNS 검증 → **ISSUED**
-3. Ingress에 `certificate-arn`, `listen-ports`(HTTPS 443 + HTTP 80), `ssl-redirect: "443"` 적용
-4. **WAF WebACL 생성 후 `aws_wafv2_web_acl_association`으로 ALB에 연결**
-   (WebACL은 Terraform이, ALB는 AWS Load Balancer Controller가 소유 — 같은 리소스를 이중 소유하지 않는다)
-5. `clinic.<도메인>` → ALB A(alias) 레코드 생성
+1. Route53 호스티드 존 생성 후 **등록기관에서 NS 위임** ✅
+2. `terraform/terraform.tfvars`: `enable_custom_domain = true` → ACM DNS 검증 → **ISSUED** ✅
+3. Ingress에 `certificate-arn`, `listen-ports`(HTTPS 443 + HTTP 80), `ssl-redirect: "443"` 적용 ✅
+4. **WAF WebACL(Terraform 소유)을 Ingress annotation `alb.ingress.kubernetes.io/wafv2-acl-arn` 으로 넘겨 AWS Load Balancer Controller 가 ALB 에 association** ✅
+   (WebACL은 Terraform이, ALB는 LBC가 소유 — 같은 리소스를 이중 소유하지 않는다)
+5. `clinic.<도메인>` → ALB A(alias) 레코드 생성 (`terraform/dns/`) ✅
 
 > WAF 관리형 규칙은 오탐 가능성이 있으므로 **초기에는 count 모드**로 관측한 뒤 block으로 전환합니다.
+> 현재는 **전부 block 모드**이며 오탐 관측은 아직 하지 않았습니다.
 
 ---
 
@@ -332,7 +349,7 @@ kubectl apply -f k8s/30-ingress.yaml
 
 - 모든 리소스에 `Project / Environment / Owner / ExpiresAt` 태그를 부여합니다(`terraform.tfvars`에서 설정).
 - Budget 알림은 **자동 비용 상한이 아닙니다.**
-- 실습 후 정리 순서(설계안 10.3): **WAF association/WebACL 삭제** → Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → foundation destroy.
+- 실습 후 정리 순서: Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → `terraform/dns` destroy → foundation destroy(WAF 포함).
 
 ```bash
 terraform destroy    # RDS deletion_protection / 최종 스냅샷 정책 먼저 확인
