@@ -67,7 +67,7 @@ spec:
               app.kubernetes.io/component: app
       containers:
         - name: app
-          image: 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/petclinic-app:1.0.3
+          image: 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/petclinic-app:1.0.6
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -366,6 +366,7 @@ terraform destroy    # RDS deletion_protection / 최종 스냅샷 정책 먼저 
 | [보류 항목 추가 구현 계획](docs/보류항목_추가구현_계획.md) | 미구현 9개 항목의 구현 방법·완료 판정·위험 |
 | [자료 검토 및 출처](docs/자료_검토_및_출처.md) | 참고 자료와 실제 소스의 차이, 적용·제외 판단 |
 | [아키텍처 토폴로지](docs/아키텍처_토폴로지.drawio) | draw.io 다이어그램 (다이어그램 편집기로 열기) |
+| [5일 스터디 커리큘럼](docs/5일_스터디_커리큘럼.md) | **EC2 3-tier 경험자용** Docker/Kubernetes 흐름 학습 계획 (5일). 클러스터→노드→Pod→Service→Ingress 흐름을 EC2 개념과 짝지어 설명 |
 
 토폴로지 재생성:
 
