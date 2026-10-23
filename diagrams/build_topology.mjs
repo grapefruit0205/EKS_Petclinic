@@ -7,6 +7,8 @@
 //        → Pod 를 EC2 아이콘으로 그리던 오류 수정 (Pod = container, 노드 = ec2)
 //     3) Pod IP ↔ 노드 IP 를 함께 표기 (VPC CNI: Pod IP = 노드 ENI 보조 IP)
 //     4) "우리가 선언한 것 → 컨트롤러가 만든 것" 매핑 박스 추가
+//     5) NAT 를 AZ별 2개 → Regional NAT Gateway 1개로 교체
+//        (VPC 단위 리소스라 서브넷 안이 아니라 VPC 바로 아래에 배치)
 //
 // 생성: drawio-ai-kit (aws/build_vpc_eks.mjs 구조 기반, 좌표 하드코딩 없음)
 // 실행: cd <drawio-ai-kit 설치 디렉터리> && ./node_modules/.bin/drawio-ai run <이 파일>
@@ -47,7 +49,6 @@ const az = (s, c) => {
   return group(`az_${s}`, "group_availability_zone", `Availability Zone ap-northeast-2${s}`, { dir: "col", gap: 26, align: "center" }, [
     group(`az_${s}_pub`, "group_subnet", `Public  ${c.pub}`, { dir: "row", gap: 14 }, [
       icon(`alb_${s}`, "application_load_balancer", "ALB node\n(internet-facing)"),
-      icon(`nat_${s}`, "nat_gateway", "NAT Gateway"),
     ]),
     group(`az_${s}_wl`, "group_subnet", `Private workloads  ${c.wl}  (노드 IP 와 Pod IP 가 같은 대역)`, { dir: "col", gap: 14 }, [
       nodeFrame("web", c.webNode, "web-system", `web_${s}`, `Pod web (nginx 1.29)\n${c.webPod}:8080\n↳ 노드 ENI 보조 IP`),
@@ -63,6 +64,7 @@ const az = (s, c) => {
 
 const vpc = group("vpc", "group_vpc", "VPC 10.20.0.0/16", { dir: "col", gap: 30, align: "center" }, [
   icon("igw", "internet_gateway", "Internet Gateway"),
+  icon("nat", "nat_gateway", "Regional NAT Gateway · nat-1c1ac9ec3a5040e00\nVPC 단위 (Subnet 소속 없음) · AZ 자동 프로비저닝\nEIP 2a 3.39.80.20 / 2b 52.79.231.223"),
   group("az_row", "group_aws_cloud", "", { dir: "row", gap: 70, align: "top" }, [
     az("a", {
       pub: "10.20.0.0/24", wl: "10.20.32.0/20", data: "10.20.80.0/24", instanceType: "m6i.large",
@@ -122,8 +124,7 @@ d.link("web_a", "app_a", "", { dir: "TB" });
 // ── 7. 지원 / 보조 경로 (점선) ──────────────────────────────────────────────
 d.link("route53", "alb_a", "A alias (DNS)", { dir: "TB", dash: true });
 d.link("acm", "alb_b", "TLS 인증서", { dir: "TB", dash: true });
-d.link("nat_a", "igw", "egress", { dir: "TB", dash: true });
-d.link("nat_b", "igw", "", { dir: "TB", dash: true });
+d.link("nat", "igw", "egress (AZ 별 자동 프로비저닝)", { dir: "TB", dash: true });
 d.link("ecr", "az_b_wl", "image pull", { dir: "TB", dash: true });
 d.link("secrets", "az_b_wl", "secret file mount", { dir: "TB", dash: true });
 d.link("logs", "az_a_wl", "logs / metrics", { dir: "TB", dash: true });
@@ -153,18 +154,19 @@ const legendY = declY + 148 + 30;
 d.box(
   "legend",
   [40, legendY],
-  [1358, 104],
+  [1358, 124],
   [
     "범례",
     "──  실선 : 실제 동작 경로 (번호 1→5 = 브라우저 → AWS WAF → internet-facing ALB → Pod web → Pod app → RDS)",
     "- - 점선 : 지원 경로 (DNS / TLS / egress / image pull / secret mount / logs / kubelet 상태 보고)",
     "Pod IP = 노드 ENI 의 보조 IP (VPC CNI) → ALB 가 Pod 를 직접 target 으로 등록한다. ClusterIP 는 VPC 대역 밖의 가상 IP (iptables).",
     "Isolated data 서브넷 : NAT/IGW 경로 없음 (VPC local 만) · RDS Multi-AZ (2b primary / 2a standby)",
+    "Regional NAT Gateway : VPC 단위 리소스 (Subnet 소속 없음) · AZ 자동 프로비저닝 → AZ 별 zonal NAT 2개를 대체 (AZ 확장 시 NAT 추가 불필요, 대신 blast radius = VPC 전체)",
   ].join("\n"),
   { fill: "#FFFFFF", stroke: "#999999", va: "top" }
 );
 
 const res = d.validate();
 console.log("VALIDATE:", JSON.stringify({ ok: res.ok, errors: res.errors, warnings: res.warnings, advice: res.audit.advice }));
-writeFileSync(OUT, d.mxfile("Petclinic 3-Tier on EKS — topology (v2)"));
+writeFileSync(OUT, d.mxfile("Petclinic 3-Tier on EKS — topology (v2 · Regional NAT)"));
 console.log("WROTE:", OUT);

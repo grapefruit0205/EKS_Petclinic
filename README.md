@@ -78,13 +78,14 @@ internet-facing ALB  (public 서브넷 2개 AZ)
 
 | 계층 | CIDR (AZ-a / AZ-b) | 용도 |
 |---|---|---|
-| Public | `10.20.0.0/24` / `10.20.1.0/24` | Internet Gateway, **AZ별 NAT Gateway 2개**, **internet-facing ALB** |
+| Public | `10.20.0.0/24` / `10.20.1.0/24` | Internet Gateway, **Regional NAT Gateway 1개**(VPC 단위), **internet-facing ALB** |
 | Private workloads | `10.20.32.0/20` / `10.20.48.0/20` | EKS 노드 / VPC CNI Pod IP |
 | Isolated data | `10.20.80.0/24` / `10.20.81.0/24` | RDS. **인터넷 기본 경로 없음(VPC local 라우팅만)** |
 
 > v1의 `Private ingress 10.20.8.0/24 · 10.20.9.0/24` 는 VPC Link ENI 전용이었고 **v2에서 제거했습니다**(서브넷·라우팅 연결 삭제 완료).
 
 VPC endpoint: S3 Gateway + interface 9종(ecr.api, ecr.dkr, sts, secretsmanager, logs, eks-auth, ssm, ssmmessages, ec2messages)
+> **NAT:** zonal NAT Gateway 2개 → **Regional NAT Gateway 1개**(`availability_mode = "regional"`, `vpc_id`로 생성, Subnet 소속 없음)로 전환했습니다(2026-10-23). AZ↔EIP는 `availability_zone_address`로 명시해 AWS 자동 프로비저닝 EIP를 쓰지 않습니다(미지정 시 자동 모드가 자체 EIP를 만들어 넘긴 `allocation_id`를 무시하는 것을 실측 확인). AZ 확장 시 NAT 추가가 불필요한 대신 **blast radius = VPC 전체**이며, 기존 EIP를 재사용했으므로 전환 중 egress 공백이 있었습니다. `nat_gateway_mode = "zonal"`로 이전 방식도 선택 가능합니다.
 
 ### 진입 · 보호 (v2)
 
@@ -345,7 +346,7 @@ kubectl apply -f k8s/30-ingress.rendered.yaml
 
 ## 10. 비용 주의
 
-이 구성은 **실제 과금되는 리소스**를 만듭니다. EKS control plane, 노드 4대, **RDS Multi-AZ**, NAT Gateway 2개, interface VPC endpoint 9개, **internet-facing ALB + AWS WAF**, CloudWatch Logs, ECR, KMS가 계속 과금됩니다.
+이 구성은 **실제 과금되는 리소스**를 만듭니다. EKS control plane, 노드 4대, **RDS Multi-AZ**, Regional NAT Gateway 1개, interface VPC endpoint 9개, **internet-facing ALB + AWS WAF**, CloudWatch Logs, ECR, KMS가 계속 과금됩니다.
 
 - 모든 리소스에 `Project / Environment / Owner / ExpiresAt` 태그를 부여합니다(`terraform.tfvars`에서 설정).
 - Budget 알림은 **자동 비용 상한이 아닙니다.**

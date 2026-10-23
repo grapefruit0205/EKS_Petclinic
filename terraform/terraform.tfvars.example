@@ -25,8 +25,10 @@ public_subnet_cidrs   = ["10.20.0.0/24", "10.20.1.0/24"]
 workload_subnet_cidrs = ["10.20.32.0/20", "10.20.48.0/20"]
 data_subnet_cidrs     = ["10.20.80.0/24", "10.20.81.0/24"]
 
-# 운영형: AZ별 NAT 2개
-single_nat_gateway = false
+# NAT Gateway — regional: 단일 리소스가 VPC 의 모든 AZ 를 커버 (AZ 자동 확장)
+#   zonal 로 바꾸면 AZ별 NAT Gateway 를 만든다 (이전 방식)
+nat_gateway_mode       = "regional"
+regional_nat_eip_count = 2
 
 # EKS
 cluster_name       = "petclinic-dev"

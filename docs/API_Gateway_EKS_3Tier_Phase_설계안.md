@@ -13,6 +13,7 @@
 | 채택 | internet-facing ALB 직접 진입, AWS WAF Regional WebACL |
 | 유지 | EKS·RDS·ECR·IRSA·Route 53·ACM, Nginx Web·Spring MVC App·Data의 3-Tier |
 | 영향 | VPC 4→3계층, 보안 그룹 단순화, 요청·연결 계층 제거에 따른 비용 구조 변화 |
+| 후속 조정 | NAT를 AZ별 zonal 2개 → **Regional NAT Gateway 1개**(VPC 단위, AZ 자동 프로비저닝, EIP는 AZ별 명시)로 전환. 구축 후 적용한 변경이며 §4.1·§5.1·§10.1·§10.3에 반영 |
 
 파일명은 v1 기준이며 이력 보존을 위해 유지한다. 이 문서는 v2의 구축 전 설계안이며 실제 구축·검증 결과를 나타내지 않는다.
 
@@ -113,13 +114,16 @@ VPC `10.20.0.0/16` 예시. 기존 네트워크·VPN·Kubernetes Service CIDR과 
 
 | 용도 | AZ-A 예시 | AZ-B 예시 | 기본 경로/용도 |
 |---|---|---|---|
-| Public | `10.20.0.0/24` | `10.20.1.0/24` | IGW, AZ별 NAT Gateway 1개씩 총 2개, internet-facing ALB. 워커·DB 배치 안 함 |
-| Private workloads | `10.20.32.0/20` | `10.20.48.0/20` | EKS 노드·VPC CNI Pod IP. 각 AZ의 NAT로 기본 경로 설정 |
+| Public | `10.20.0.0/24` | `10.20.1.0/24` | IGW, internet-facing ALB. 워커·DB 배치 안 함 |
+| Private workloads | `10.20.32.0/20` | `10.20.48.0/20` | EKS 노드·VPC CNI Pod IP. 기본 경로는 Regional NAT Gateway |
 | Isolated data | `10.20.80.0/24` | `10.20.81.0/24` | RDS subnet group; 인터넷 기본 경로 없음(VPC local만) |
 
 - VPC는 위 3계층으로 구성한다. Public 서브넷만 ALB 대상 태그(`kubernetes.io/role/elb=1`)/명시적 subnet ID로 선택하며 DB subnet을 자동 검색 대상에 넣지 않는다.
 - ALB 확장용 IP와 노드·Pod IP 할당량을 별도로 계산한다. `/24`, `/20`은 출발점이며 무제한 확장을 보장하지 않는다.
-- NAT는 AZ별 1개씩 총 2개를 기본으로 하여 다른 AZ의 NAT에 의존하는 경로를 피한다.
+- **NAT는 Regional NAT Gateway 1개를 기본으로 한다.** `availability-mode=regional`은 VPC 단위 리소스로 subnet에 속하지 않으며(`describe-nat-gateways`의 `SubnetId`가 비어 있음), VPC의 각 AZ에 NAT를 자동 프로비저닝한다. AZ가 늘어도 리소스를 추가하지 않는다.
+- 대신 **EIP를 AZ별로 명시**해야 한다. `availability_zone_address`(Terraform `aws_nat_gateway`)를 지정하지 않으면 AWS가 EIP를 자체 생성·관리하고(자동 프로비저닝 모드) 사전에 만든 EIP는 쓰이지 않는다. AZ 수만큼 EIP를 계획하고, apply 후 주소가 우리 `eipalloc`과 일치하는지와 `auto_provision_zones`/`auto_scaling_ips`가 `disabled`인지 확인한다.
+- Regional은 **blast radius가 VPC 전체**다. Zonal NAT 2개는 한 AZ의 NAT 장애가 그 AZ 경로에만 영향을 주지만, regional은 단일 리소스라 장애·설정 변경의 영향 범위가 넓다. AZ 단위 격리가 요건이면 zonal 2개를 유지한다.
+- zonal → regional 전환은 **새 NAT 생성 → 라우팅 테이블 전환 → 구 NAT 삭제** 순서로 한다. 단 **기존 EIP를 재사용하면 구 zonal NAT가 먼저 주소를 놓아야** 새 NAT가 그 주소를 잡을 수 있으므로 그 사이 egress가 끊긴다. egress 무중단이 요건이면 **새 EIP를 발급**해 regional NAT에 붙이고 라우팅을 바꾼 뒤 구 NAT·구 EIP를 해제한다.
 - ECR API/DKR, S3 gateway endpoint, STS, Secrets Manager, CloudWatch Logs, EKS Auth(Pod Identity), SSM 관련 endpoint를 필요한 것만 검토한다. Endpoint만 만들면 모든 외부 통신이 해결되는 것은 아니다.
 - Argo CD의 Git 접근, 외부 이미지/Helm 접근에는 별도 egress가 필요하다. 지원 endpoint가 없는 목적지는 NAT/제어된 프록시 경로를 유지한다.
 - EKS API endpoint는 private 기본. 관리자는 VPN 또는 private 관리 EC2의 SSM을 통해 접근한다. SSM은 적절한 NAT/VPC endpoint가 있으면 public IP 없이도 가능하다.
@@ -397,7 +401,7 @@ P0 범위·설계 확정 → P1 원본 실행 검증 → P2 운영화·로컬 3-
 
 **작업**
 1. Terraform state backend/잠금과 CI plan 검토 절차를 먼저 준비한다.
-2. VPC `10.20.0.0/16`에 §4.1의 Public/Private workloads/Isolated data 3계층·2 AZ의 총 6개 subnet, route, AZ별 NAT 2개, 필요 endpoint/SG/DNS를 생성한다. Public만 IGW를 연결하고 workloads는 같은 AZ NAT를 사용한다. DB 서브넷은 인터넷 기본 경로 없이 VPC local만 둔다.
+2. VPC `10.20.0.0/16`에 §4.1의 Public/Private workloads/Isolated data 3계층·2 AZ의 총 6개 subnet, route, **Regional NAT Gateway 1개(AZ별 EIP를 명시)**, 필요 endpoint/SG/DNS를 생성한다. Public만 IGW를 연결하고 workloads는 regional NAT를 기본 경로로 쓴다. DB 서브넷은 인터넷 기본 경로 없이 VPC local만 둔다.
 3. ECR `petclinic-web`, `petclinic-app`을 private·immutable tag·암호화·scan·lifecycle로 구성한다. BuildKit/buildx가 생성하는 OCI manifest index·플랫폼별 본체·provenance attestation에서 태그가 인덱스에만 붙고 참조된 하위 매니페스트는 untagged 행으로 보일 수 있으므로, 단순 "태그 없는 이미지 즉시 만료" 규칙으로 활성 태그의 하위 참조가 깨지지 않게 설계한다.
 4. 관리/CI/노드/컨트롤러/비밀 접근 역할을 분리한다. GitHub OIDC trust를 repo/environment로 제한한다.
 5. Secrets 메타데이터와 비용 tag(`Project`, `Environment`, `Owner`, `ExpiresAt`)를 정의하고 Budget 알림을 연결한다.
@@ -557,7 +561,7 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 |---|---|---|
 | EKS control plane | 1 cluster, 생성 기간 내 계속 과금 | 환경별 cluster 분리 검토, 지원 기간 관리 |
 | Worker | 공유 2노드로 축소 가능, Tier SG 격리 약화 명시 | Web/system 2 + App 2부터 시작, 확장 여유 |
-| NAT | AZ별 1개씩 총 2개, 기간·처리량 축소 | AZ별 1개씩 2개 + 처리 GB |
+| NAT | Regional NAT Gateway 1개(AZ 자동 프로비저닝, EIP는 AZ별 명시), 기간·처리량 축소 | Regional NAT 1개 + AZ 수만큼 EIP + 처리 GB |
 | ALB | 1개, 시간 + LCU | ALB 시간 + LCU·전송량 |
 | AWS WAF | WebACL 월정액 + 규칙 요금 + 요청 100만 건당 과금 | 동일 과금 요소 + 규모별 요청량·로그; 정확한 단가는 Phase 0에서 Pricing Calculator로 확인 |
 | RDS | Single-AZ 허용, HA 시험은 별도 | Multi-AZ + backup/storage/I/O |
@@ -589,7 +593,7 @@ PR → Maven verify + MySQL 통합시험 + 보안/설정 검사
 
 ### 10.3 실습 자원 정리 순서
 
-증빙·데이터 보관 승인 및 공개 중단(ALB SG 제한) → Argo 자동 sync 중단/정리 대상 확정 → **WAF association/WebACL 제거**(Terraform edge) → **Ingress 삭제 및 LBC의 ALB/TG 삭제 완료 확인** → Route 53 alias·전용 ACM/edge 잔여 리소스 정리 → App/addon/nodegroup/cluster 정리 → 승인된 RDS 최종 snapshot 및 DB 삭제 → NAT/endpoint/ENI/SG/VPC 정리 → 필요 없는 ECR/EBS/EIP/로그/Secret 점검.
+증빙·데이터 보관 승인 및 공개 중단(ALB SG 제한) → Argo 자동 sync 중단/정리 대상 확정 → **WAF association/WebACL 제거**(Terraform edge) → **Ingress 삭제 및 LBC의 ALB/TG 삭제 완료 확인** → Route 53 alias·전용 ACM/edge 잔여 리소스 정리 → App/addon/nodegroup/cluster 정리 → 승인된 RDS 최종 snapshot 및 DB 삭제 → NAT/endpoint/ENI/SG/VPC 정리(regional NAT가 AZ에 자동 프로비저닝한 NAT와 미사용 EIP 해제까지 확인) → 필요 없는 ECR/EBS/로그/Secret 점검.
 
 컨트롤러를 먼저 없애 ALB 삭제 finalizer가 고립되지 않도록 한다. retained snapshot·로그·도메인·state·ECR은 별도 과금될 수 있으므로 보관 기한과 소유자를 남긴다. 공유 VPC·공유 IAM·공유 DNS는 프로젝트 전용 자원과 구분한다.
 

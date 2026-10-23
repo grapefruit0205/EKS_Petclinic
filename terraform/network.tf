@@ -14,7 +14,8 @@ module "network" {
   workload_subnet_cidrs = var.workload_subnet_cidrs
   data_subnet_cidrs     = var.data_subnet_cidrs
 
-  single_nat_gateway  = var.single_nat_gateway
-  interface_endpoints = var.interface_endpoints
-  enable_flow_logs    = var.enable_flow_logs
+  nat_gateway_mode       = var.nat_gateway_mode
+  regional_nat_eip_count = var.regional_nat_eip_count
+  interface_endpoints    = var.interface_endpoints
+  enable_flow_logs       = var.enable_flow_logs
 }
