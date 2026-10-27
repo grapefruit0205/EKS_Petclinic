@@ -342,6 +342,15 @@ kubectl apply -f k8s/30-ingress.rendered.yaml
 | D8 | 부하·장애·복구 시험 | 미수행 |
 | D9 | Terraform state 원격화 | 로컬 state |
 
+### 의도적으로 넣지 않은 것 (미구현 아님)
+
+아래 둘은 빠뜨린 항목이 아니라 **선택의 결과**입니다.
+
+| 항목 | 왜 없는가 |
+|---|---|
+| EKS 컨트롤 플레인 | `aws_eks_cluster`가 클러스터 생성 시 자동으로 만든다(끄는 인자 없음). 문서·토폴로지의 밴드는 IRSA 신뢰(OIDC issuer)·private endpoint ENI가 우리 서브넷에 주입되는 사실·클러스터 시간 과금을 설명하기 위해 유지한다 |
+| Gateway API 구현체 (NGINX Gateway Fabric 등) | L7은 internet-facing ALB가 담당하고 Ingress는 `ingressClassName: alb`다. LBC는 Ingress를 읽어 ALB를 만들 뿐 데이터 경로에 없으며, 구현체를 넣으면 NLB 경유가 되어 **WAF를 붙일 수 없다**. Gateway API 표준 준수나 멀티클러스터 라우팅이 요건이 될 때만 `CloudFront(WAF) → NLB → NGF`로 재설계한다 |
+
 ---
 
 ## 10. 비용 주의

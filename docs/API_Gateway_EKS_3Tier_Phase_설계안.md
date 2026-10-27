@@ -14,6 +14,7 @@
 | 유지 | EKS·RDS·ECR·IRSA·Route 53·ACM, Nginx Web·Spring MVC App·Data의 3-Tier |
 | 영향 | VPC 4→3계층, 보안 그룹 단순화, 요청·연결 계층 제거에 따른 비용 구조 변화 |
 | 후속 조정 | NAT를 AZ별 zonal 2개 → **Regional NAT Gateway 1개**(VPC 단위, AZ 자동 프로비저닝, EIP는 AZ별 명시)로 전환. 구축 후 적용한 변경이며 §4.1·§5.1·§10.1·§10.3에 반영 |
+| 설명 보강 | 컨트롤 플레인·데이터 플레인의 소유 경계(§7.3)와 L7 진입 계층에서 Gateway API 구현체를 채택하지 않는 근거(§7.4)를 추가. §7.2 도구 표의 폐기된 `terraform/edge` 표기를 `waf`+`dns`로 정정 |
 
 파일명은 v1 기준이며 이력 보존을 위해 유지한다. 이 문서는 v2의 구축 전 설계안이며 실제 구축·검증 결과를 나타내지 않는다.
 
@@ -313,12 +314,51 @@ ALB는 호스트/경로 기반 L7 라우팅을 제공하며 **API 키·사용량
 | Helm/Argo CD `platform` | 컨트롤러·운영 addon, namespace/RBAC 정책 |
 | Helm/Argo CD `workload` | Web/App/Service/Ingress/HPA/PDB/NetworkPolicy/migration Job |
 | AWS Load Balancer Controller | Ingress 선언을 읽고 ALB/listener/target group 실제 생성·조정 |
-| Terraform `edge` | LBC가 생성한 ALB ARN/DNS/hosted zone ID를 입력받아 WAF WebACL·association·로그 및 Route 53 A alias 관리 |
+| Terraform `waf` + `dns` | WAF WebACL·association·로그는 foundation이 소유하고, LBC가 만든 ALB를 tag로 조회해 Route 53 A alias를 연결한다(v2에서 `terraform/edge` 폐기) |
 | GitHub Actions | 소스 테스트, 이미지 빌드·스캔·서명, ECR push, 배포 Git의 digest 변경 PR |
 
 **동일 ALB/listener를 Terraform과 LBC가 동시에 소유하지 않는다.** foundation → platform → workload/ALB → edge 순서로 분리한다. ALB ARN/DNS/hosted zone ID를 tag 및 이름으로 조회·검증해 edge 입력에 연결하고, ALB 교체 시 WAF association과 DNS alias를 함께 갱신한다. WAF association은 Terraform만 소유하며 Ingress의 WAF 연결 annotation과 중복 관리하지 않는다. Terraform state는 암호화·접근 제한·잠금·버전 보관을 적용한다.
 
 GitHub runner가 private EKS API에 직접 접속할 필요 없이 Argo CD가 배포 Git을 pull하도록 한다. 초기 addon 설치·긴급 복구는 VPC 내부 관리 경로를 사용한다. Argo CD UI를 별도 무인증 public LB로 만들지 않는다.
+
+### 7.3 컨트롤 플레인 · 데이터 플레인의 경계
+
+`aws_eks_cluster`(`modules/eks/main.tf`)를 생성하는 순간 API Server, etcd, scheduler, controller-manager, OIDC issuer가 함께 만들어지며 이를 끄는 인자는 없다. 컨트롤 플레인은 선택 항목이 아니라 EKS를 EKS로 만드는 요소이고, 노드그룹만 남기고 컨트롤 플레인을 제거한 구성은 존재하지 않는다.
+
+| 소유 | 대상 | 우리가 하는 일 |
+|---|---|---|
+| AWS | 컨트롤 플레인 — API Server, etcd, scheduler, controller-manager, OIDC issuer | 설정만 지정. 컴포넌트에 접근·패치 불가. 클러스터 시간 과금 |
+| 우리 | 데이터 플레인 — MNG 4노드, kubelet, VPC CNI, addon 5종, Deployment/Service/Ingress | 버전·용량·드레인·스케줄링·장애 대응 전부 |
+
+우리가 명시적으로 고정한 컨트롤 플레인 설정은 다음과 같다.
+
+| 설정 | 값 |
+|---|---|
+| 엔드포인트 | `endpoint_private_access = true`, `endpoint_public_access`는 변수(기본 private 전용) |
+| 인증 | `authentication_mode = API_AND_CONFIG_MAP` + 생성자 admin 부여 |
+| 암호화 | `encryption_config` — KMS로 etcd의 Secret 암호화 |
+| 로그 | `enabled_cluster_log_types` → CloudWatch 14일 보관 |
+| 요금 등급 | `billing_mode` 미설정 → standard tier |
+
+이 경계를 문서와 토폴로지에 남기는 이유는, 설명이 필요한 세 가지가 모두 컨트롤 플레인에서 유래하기 때문이다.
+
+1. **IRSA 신뢰의 출처** — OIDC issuer가 컨트롤 플레인에 있고 ServiceAccount 토큰이 그 키로 서명된다. LBC·CSI·ExternalDNS가 AWS 권한을 얻는 경로가 여기서 시작한다.
+2. **private endpoint의 실체** — 연산 자원은 AWS 소유 계정에 있으나 endpoint ENI는 우리 서브넷에 주입된다. 그래서 관리 인스턴스 SG에서 cluster SG로 가는 443 규칙이 필요하다(구축 중 이 규칙 누락으로 API 접근이 막혔다).
+3. **과금 근거** — 클러스터 시간 요금은 데이터 플레인 노드 요금과 별개 항목이다.
+
+### 7.4 L7 진입 계층 — Gateway API 구현체를 추가하지 않는 이유
+
+L7 라우팅 주체는 "AWS ALB"와 "클러스터 내부 구현체(NGINX Gateway Fabric 등)"로 갈린다. 현재 구성은 전자이며 후자를 추가할 실익이 없다.
+
+| 항목 | 현재 — ALB + LBC | Gateway API 구현체 추가 시 |
+|---|---|---|
+| L7 처리 위치 | AWS 관리형 ALB | 클러스터 내부 Pod |
+| 데이터 경로 | ALB → Pod IP (`target-type: ip`) | LB → NGF Pod → Service → App Pod |
+| WAF | ALB에 직접 부착 | NLB에는 부착 불가 → WAF 상실 |
+| 홉 수 | 1 | 2 이상 |
+| 추가로 필요한 것 | Ingress 1개 | Gateway API CRD, GatewayClass, NGF Deployment, LB Service |
+
+LBC는 Ingress를 읽어 AWS API로 ALB를 만들 뿐 HTTP 트래픽이 지나가지 않는다. 이 클러스터에는 Gateway API CRD·GatewayClass·NGF Deployment가 없고 Ingress의 `ingressClassName`은 `alb`다. NGF를 도입하면 WAF를 유지하기 위해 CloudFront를 앞에 두는 재설계(CloudFront+WAF → NLB → NGF)가 필요하다. Gateway API 표준 준수나 멀티클러스터 라우팅이 요건이 될 때만 정당화되며, 현재 요건에는 해당하지 않으므로 채택하지 않는다.
 
 ## 8. Phase별 실행 계획
 
