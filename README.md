@@ -359,11 +359,34 @@ kubectl apply -f k8s/30-ingress.rendered.yaml
 
 - 모든 리소스에 `Project / Environment / Owner / ExpiresAt` 태그를 부여합니다(`terraform.tfvars`에서 설정).
 - Budget 알림은 **자동 비용 상한이 아닙니다.**
-- 실습 후 정리 순서: Ingress 삭제 → LBC가 ALB/TG 삭제 완료 확인 → `terraform/dns` destroy → foundation destroy(WAF 포함).
+- **정리 순서는 `terraform/dns` → Ingress → foundation 이다.** `terraform/dns`가 `data.aws_lb`로 ALB를 조회하므로, ALB가 먼저 사라지면 destroy 계획이 실패한다.
 
 ```bash
-terraform destroy    # RDS deletion_protection / 최종 스냅샷 정책 먼저 확인
+# 1) dns 먼저 (ALB 가 살아있을 때)
+cd terraform/dns && terraform destroy
+# 2) Ingress 삭제 → LBC 가 ALB/TG 삭제를 끝낼 때까지 확인
+kubectl -n petclinic-dev delete ingress petclinic-web
+aws elbv2 describe-load-balancers          # 0개 확인
+# 3) 워크로드 · Helm
+kubectl delete namespace petclinic-dev
+helm uninstall aws-load-balancer-controller -n kube-system
+helm uninstall metrics-server -n kube-system
+# 4) RDS 삭제 보호 해제 → foundation destroy
+#    tfvars: db_deletion_protection=false / db_skip_final_snapshot=true 로 바꾸고 apply 후 destroy
+cd terraform && terraform apply && terraform destroy
 ```
+
+**Terraform 밖에서 손으로 지워야 하는 것** (실제 해체에서 확인):
+
+| 리소스 | 그대로 두면 | 처리 |
+|---|---|---|
+| ECR 안의 이미지 | `RepositoryNotEmptyException` | `aws ecr delete-repository --force` |
+| 노드 종료 후 남은 ENI | subnet·SG `DependencyViolation` | ENI 삭제 |
+| EKS 관리형 `eks-cluster-sg-*` | VPC `DependencyViolation` | SG 수동 삭제 |
+| RDS 자동 스냅샷 | 7일 보관·과금 | `aws rds delete-db-instance-automated-backup` |
+| RDS 로그 그룹 2개 | 계속 과금 | `aws logs delete-log-group` |
+| KMS 키 | 즉시 삭제 불가 | `PendingDeletion` 만료 대기 |
+| Route 53 호스티드 존 | 도메인 NS 위임이 끊김 | 유지하려면 destroy 전에 분리 |
 
 ---
 
